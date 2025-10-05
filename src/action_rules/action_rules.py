@@ -164,17 +164,29 @@ class ActionRules:
         - The function first combines the lengths of item lists from both dictionaries.
         - It then calculates the sum of the products of all possible combinations of these lengths.
         """
-        import numpy
 
-        values_in_attribute = []
-        for items in list(stable_items_binding.values()) + list(flexible_items_binding.values()):
-            values_in_attribute.append(len(items))
+        lengths = []
 
-        sum_nodes = 0
-        for i in range(len(values_in_attribute)):
-            for comb in itertools.combinations(values_in_attribute, i + 1):
-                sum_nodes += int(numpy.prod(comb))
-        return sum_nodes
+        # count number of values in each attribute
+        for items in stable_items_binding.values():
+            lengths.append(len(items))
+
+        for items in flexible_items_binding.values():
+            lengths.append(len(items))
+
+        # if nodes are empty, there are no attributes
+        if len(lengths) == 0:
+            return 0
+        
+        total_combinations = 1
+        for n in lengths:
+            total_combinations *= (n + 1)
+        
+        # substract 1 used for multiplication
+        total_combinations -= 1  
+
+        return total_combinations
+        
 
     def set_array_library(self, use_gpu: bool, df: Union['cudf.DataFrame', 'pandas.DataFrame']):
         """
