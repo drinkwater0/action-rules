@@ -303,6 +303,77 @@ class ActionRules:
                 data = df.to_numpy(dtype=self.np.uint8).T  # type: ignore
         return data, columns
 
+    def build_bit_masks(
+        self,
+        data: Union['numpy.ndarray', 'cupy.ndarray'],
+    ) -> tuple:
+        """
+        Pack a binary feature matrix into 64-bit masks for fast intersection.
+
+        Parameters
+        ----------
+        data : Union[numpy.ndarray, cupy.ndarray]
+            Dense matrix produced by `df_to_array`, shaped (num_attributes, num_transactions)
+            and containing 0/1 values.
+
+        Returns
+        -------
+        tuple
+            (bit_masks, index_bit_lookup) where:
+              - bit_masks is a uint64 array with shape (num_attributes, num_words)
+                holding packed transaction bits for each item.
+              - index_bit_lookup maps each transaction index to a tuple
+                (word_offset, bit_index) inside the packed representation.
+
+        Notes
+        -----
+        - The packing uses 64-bit little-endian words (bit 0 corresponds to the
+          first transaction in each chunk).
+        - Sparse inputs are not supported; callers should densify before packing.
+        """
+        if self.np is None:
+            raise RuntimeError("Array library is not initialised. Call set_array_library first.")
+
+
+        # get number of attributes and number of transactions
+        num_attributes, num_transactions = data.shape
+        # into how many 64-bit words we will separate the transactions bits
+        num_words = (num_transactions + 63) // 64
+
+        # initialize bit masks array to zeros
+        bit_masks = self.np.zeros((num_attributes, num_words), dtype=self.np.uint64)
+        # prepare np and cupy friendly value of 1
+        one = self.np.uint64(1)
+
+        for attribute_index in range(num_attributes):
+            for transaction_index in range(num_transactions):
+
+                # get one-hot value of attribute in the transaction
+                cell = data[attribute_index, transaction_index]
+                # convert to int if needed
+                if hasattr(cell, "item"):
+                    cell_value = int(cell.item())
+                else:
+                    cell_value = int(cell)
+                
+                # mask is already set to zeros, so skipping
+                if cell_value == 0:
+                    continue
+                
+                # set the corresponding bit in the bit mask
+                word_offset = transaction_index // 64
+                bit_offset = transaction_index % 64
+                bit_masks[attribute_index, word_offset] |= one << self.np.uint64(bit_offset)
+
+        # create lookup table for transactions
+        index_bit_lookup = {}
+        for transaction_index in range(num_transactions):
+            word_offset = transaction_index // 64
+            bit_offset = transaction_index % 64
+            index_bit_lookup[transaction_index] = (word_offset, bit_offset)
+
+        return bit_masks, index_bit_lookup
+
     def one_hot_encode(
         self,
         data: Union['cudf.DataFrame', 'pandas.DataFrame'],

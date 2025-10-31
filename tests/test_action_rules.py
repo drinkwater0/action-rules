@@ -165,6 +165,72 @@ def test_one_hot_encode_empty_stable(action_rules):
     assert set(encoded_df.columns) == set(expected_columns)
 
 
+def test_build_bit_masks_single_word(action_rules):
+    """
+    Verify that a small binary matrix is packed into a single 64-bit word per attribute.
+    """
+    action_rules.set_array_library(use_gpu=False, df=pd.DataFrame({'dummy': [0]}))
+    data = np.array(
+        [
+            [1, 0, 1],
+            [0, 1, 0],
+        ],
+        dtype=np.uint8,
+    )
+
+    bit_masks, index_lookup = action_rules.build_bit_masks(data)
+
+    assert bit_masks.shape == (2, 1)
+    assert bit_masks.dtype == np.uint64
+    assert bit_masks[0, 0] == np.uint64(0b00000000000000000000000000000101)
+    assert bit_masks[1, 0] == np.uint64(0b00000000000000000000000000000010)
+    assert index_lookup[0] == (0, 0)
+    assert index_lookup[1] == (0, 1)
+    assert index_lookup[2] == (0, 2)
+
+
+def test_build_bit_masks_multiple_words(action_rules):
+    """
+    Verify that packing spans multiple 64-bit words when transactions exceed 64 entries.
+    """
+    action_rules.set_array_library(use_gpu=False, df=pd.DataFrame({'dummy': [0]}))
+    data = np.zeros((2, 130), dtype=np.uint8)
+    # attribute #0 hits several boundary positions
+    data[0, 0] = 1
+    data[0, 63] = 1
+    data[0, 64] = 1
+    data[0, 129] = 1
+    # attribute #1 lights up different offsets
+    data[1, 1] = 1
+    data[1, 62] = 1
+    data[1, 65] = 1
+    data[1, 100] = 1
+    data[1, 128] = 1
+
+    bit_masks, index_lookup = action_rules.build_bit_masks(data)
+
+    assert bit_masks.shape == (2, 3)
+
+    attr0_word0 = (np.uint64(1) << np.uint64(0)) | (np.uint64(1) << np.uint64(63))
+    attr0_word1 = np.uint64(1) << np.uint64(0)
+    attr0_word2 = np.uint64(1) << np.uint64(1)
+    assert bit_masks[0, 0] == attr0_word0
+    assert bit_masks[0, 1] == attr0_word1
+    assert bit_masks[0, 2] == attr0_word2
+
+    attr1_word0 = (np.uint64(1) << np.uint64(1)) | (np.uint64(1) << np.uint64(62))
+    attr1_word1 = (np.uint64(1) << np.uint64(1)) | (np.uint64(1) << np.uint64(36))
+    attr1_word2 = np.uint64(1) << np.uint64(0)
+    assert bit_masks[1, 0] == attr1_word0
+    assert bit_masks[1, 1] == attr1_word1
+    assert bit_masks[1, 2] == attr1_word2
+
+    assert index_lookup[0] == (0, 0)
+    assert index_lookup[63] == (0, 63)
+    assert index_lookup[64] == (1, 0)
+    assert index_lookup[129] == (2, 1)
+
+
 def test_get_bindings(action_rules):
     """
     Test the get_bindings method.
