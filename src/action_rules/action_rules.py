@@ -654,17 +654,20 @@ class ActionRules:
             self.transition_utility_table,
         )
         candidate_generator = CandidateGenerator(
-            frames,
-            self.min_stable_attributes,
-            self.min_flexible_attributes,
-            self.min_undesired_support,
-            self.min_desired_support,
-            self.min_undesired_confidence,
-            self.min_desired_confidence,
-            undesired_state,
-            desired_state,
-            self.rules,
-            use_sparse_matrix,
+            frames=frames,
+            frames_bit_masks=self.frames_bit_masks if not use_sparse_matrix else None,
+            bit_masks=self.bit_masks if not use_sparse_matrix else None,
+            index_bit_lookup=self.index_bit_lookup if not use_sparse_matrix else None,
+            min_stable_attributes=self.min_stable_attributes,
+            min_flexible_attributes=self.min_flexible_attributes,
+            min_undesired_support=self.min_undesired_support,
+            min_desired_support=self.min_desired_support,
+            min_undesired_confidence=self.min_undesired_confidence,
+            min_desired_confidence=self.min_desired_confidence,
+            undesired_state=undesired_state,
+            desired_state=desired_state,
+            rules=self.rules,
+            use_sparse_matrix=use_sparse_matrix,
         )
         while len(candidates_queue) > 0:
             candidate = candidates_queue.pop(0)

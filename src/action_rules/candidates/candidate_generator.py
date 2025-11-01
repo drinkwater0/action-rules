@@ -1,7 +1,7 @@
 """Class CandidateGenerator."""
 
 import copy
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from action_rules.rules import Rules
 
@@ -80,6 +80,9 @@ class CandidateGenerator:
         desired_state: int,
         rules: Rules,
         use_sparse_matrix: bool,
+        frames_bit_masks: Optional[dict] = None,
+        bit_masks: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
+        index_bit_lookup: Optional[dict] = None,
     ):
         """
         Initialize the CandidateGenerator class with the specified parameters.
@@ -108,6 +111,12 @@ class CandidateGenerator:
             Rules object to store the generated classification rules.
         use_sparse_matrix : bool, optional
             If True, sparse matrices are used. Default is False.
+        frames_bit_masks : dict, optional
+            Packed bit-mask view of frames keyed by target item index.
+        bit_masks : Union[numpy.ndarray, cupy.ndarray], optional
+            Packed bit masks for all attributes (as produced by build_bit_masks).
+        index_bit_lookup : dict, optional
+            Mapping from transaction index to (word_offset, bit_offset).
 
         Notes
         -----
@@ -116,6 +125,9 @@ class CandidateGenerator:
         rules object where generated rules are stored and supports both dense and sparse matrix operations.
         """
         self.frames = frames
+        self.frames_bit_masks = frames_bit_masks or {}
+        self.bit_masks = bit_masks
+        self.index_bit_lookup = index_bit_lookup
         self.min_stable_attributes = min_stable_attributes
         self.min_flexible_attributes = min_flexible_attributes
         self.min_undesired_support = min_undesired_support
