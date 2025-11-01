@@ -136,6 +136,10 @@ class ActionRules:
         self.is_gpu_np = False
         self.is_gpu_pd = False
         self.is_onehot = False
+        self.bit_masks = None  # type: Optional['numpy.ndarray']
+        self.index_bit_lookup = None  # type: Optional[dict]
+        self.target_state_bit_masks = None  # type: Optional[dict]
+        self.frames_bit_masks = None  # type: Optional[dict]
         self.intrinsic_utility_table = intrinsic_utility_table or {}
         self.transition_utility_table = transition_utility_table or {}
 
@@ -370,9 +374,37 @@ class ActionRules:
         for transaction_index in range(num_transactions):
             word_offset = transaction_index // 64
             bit_offset = transaction_index % 64
-            index_bit_lookup[transaction_index] = (word_offset, bit_offset)
+        index_bit_lookup[transaction_index] = (word_offset, bit_offset)
 
         return bit_masks, index_bit_lookup
+
+    def _cache_bitset_structures(
+        self,
+        bit_masks: Union['numpy.ndarray', 'cupy.ndarray'],
+        index_lookup: dict,
+        target_items_binding: dict,
+        target: str,
+    ) -> None:
+        """
+        Store packed bitset artifacts for later use in candidate evaluation.
+
+        Parameters
+        ----------
+        bit_masks : Union[numpy.ndarray, cupy.ndarray]
+            Packed transaction masks for every attribute/value.
+        index_lookup : dict
+            Mapping from transaction index to its (word_offset, bit_offset) location.
+        target_items_binding : dict
+            Mapping from target attribute name to indices of its one-hot columns.
+        target : str
+            Name of the target attribute.
+        """
+        target_state_indices = target_items_binding.get(target, [])
+        target_state_bit_masks = {index: bit_masks[index] for index in target_state_indices}
+
+        self.bit_masks = bit_masks
+        self.index_bit_lookup = index_lookup
+        self.target_state_bit_masks = target_state_bit_masks
 
     def one_hot_encode(
         self,
@@ -562,10 +594,19 @@ class ActionRules:
         """
         if self.output is not None:
             raise RuntimeError("The model is already fit.")
+
+        # reset cached bitset structures before fitting a new model
+        self.bit_masks = None
+        self.index_bit_lookup = None
+        self.target_state_bit_masks = None
+        self.frames_bit_masks = None
+
         self.set_array_library(use_gpu, data)
         if not self.is_onehot:
             data = self.one_hot_encode(data, stable_attributes, flexible_attributes, target)
         data, columns = self.df_to_array(data, use_sparse_matrix)
+
+        
 
         stable_items_binding, flexible_items_binding, target_items_binding, column_values = self.get_bindings(
             columns, stable_attributes, flexible_attributes, target
@@ -573,13 +614,20 @@ class ActionRules:
 
         self.intrinsic_utility_table, self.transition_utility_table = self.remap_utility_tables(column_values)
 
+        local_bit_masks = None
+        local_index_lookup = None
+        if not use_sparse_matrix:
+            local_bit_masks, local_index_lookup = self.build_bit_masks(data)
+            self._cache_bitset_structures(local_bit_masks, local_index_lookup, target_items_binding, target)
+            self.frames_bit_masks = self.get_split_bit_masks(target_items_binding, target)
+
         if self.verbose:
             print('Maximum number of nodes to check for support:')
             print('_____________________________________________')
             print(self.count_max_nodes(stable_items_binding, flexible_items_binding))
             print('')
         stop_list = self.get_stop_list(stable_items_binding, flexible_items_binding)
-        frames = self.get_split_tables(data, target_items_binding, target, use_sparse_matrix)
+        frames = self.get_split_tables(data, target_items_binding, target, use_sparse_matrix)  
         undesired_state = columns.index(target + '_<item_target>_' + str(target_undesired_state))
         desired_state = columns.index(target + '_<item_target>_' + str(target_desired_state))
 
@@ -768,6 +816,35 @@ class ActionRules:
             else:
                 frames[item] = data[:, mask]
         return frames
+
+    def get_split_bit_masks(self, target_items_binding: dict, target: str) -> dict:
+        """
+        Return packed bit-mask rows for each target state.
+
+        Parameters
+        ----------
+        target_items_binding : dict
+            Indexes of target attributes columns in one-hot table.
+        target : str
+            Name of the target attribute.
+
+        Returns
+        -------
+        dict
+            Dictionary mapping target attributes to the corresponding packed mask rows.
+
+        Notes
+        -----
+        Requires that `build_bit_masks` has been executed beforehand (i.e., fit was called
+        without the sparse path => data is stored in dense format).
+        """
+        if self.bit_masks is None:
+            raise RuntimeError("Bit masks are not available. Ensure fit() was run without sparse matrices.")
+
+        target_state_masks = {}
+        for item_index in target_items_binding.get(target, []):
+            target_state_masks[item_index] = self.bit_masks[item_index]
+        return target_state_masks
 
     def get_rules(self) -> Output:
         """
