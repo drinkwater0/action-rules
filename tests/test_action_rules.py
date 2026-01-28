@@ -178,15 +178,12 @@ def test_build_bit_masks_single_word(action_rules):
         dtype=np.uint8,
     )
 
-    bit_masks, index_lookup = action_rules.build_bit_masks(data)
+    bit_masks = action_rules.build_bit_masks(data)
 
     assert bit_masks.shape == (2, 1)
     assert bit_masks.dtype == np.uint64
     assert bit_masks[0, 0] == np.uint64(0b00000000000000000000000000000101)
     assert bit_masks[1, 0] == np.uint64(0b00000000000000000000000000000010)
-    assert index_lookup[0] == (0, 0)
-    assert index_lookup[1] == (0, 1)
-    assert index_lookup[2] == (0, 2)
 
 
 def test_build_bit_masks_multiple_words(action_rules):
@@ -207,7 +204,7 @@ def test_build_bit_masks_multiple_words(action_rules):
     data[1, 100] = 1
     data[1, 128] = 1
 
-    bit_masks, index_lookup = action_rules.build_bit_masks(data)
+    bit_masks = action_rules.build_bit_masks(data)
 
     assert bit_masks.shape == (2, 3)
 
@@ -225,10 +222,6 @@ def test_build_bit_masks_multiple_words(action_rules):
     assert bit_masks[1, 1] == attr1_word1
     assert bit_masks[1, 2] == attr1_word2
 
-    assert index_lookup[0] == (0, 0)
-    assert index_lookup[63] == (0, 63)
-    assert index_lookup[64] == (1, 0)
-    assert index_lookup[129] == (2, 1)
 
 
 def test_get_bindings(action_rules):

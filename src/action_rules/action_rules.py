@@ -137,7 +137,6 @@ class ActionRules:
         self.is_gpu_pd = False
         self.is_onehot = False
         self.bit_masks = None  # type: Optional['numpy.ndarray']
-        self.index_bit_lookup = None  # type: Optional[dict]
         self.target_state_bit_masks = None  # type: Optional[dict]
         self.frames_bit_masks = None  # type: Optional[dict]
         self.intrinsic_utility_table = intrinsic_utility_table or {}
@@ -310,7 +309,7 @@ class ActionRules:
     def build_bit_masks(
         self,
         data: Union['numpy.ndarray', 'cupy.ndarray'],
-    ) -> tuple:
+    ) -> Union['numpy.ndarray', 'cupy.ndarray']:
         """
         Pack a binary feature matrix into 64-bit masks for fast intersection.
 
@@ -322,12 +321,9 @@ class ActionRules:
 
         Returns
         -------
-        tuple
-            (bit_masks, index_bit_lookup) where:
-              - bit_masks is a uint64 array with shape (num_attributes, num_words)
-                holding packed transaction bits for each item.
-              - index_bit_lookup maps each transaction index to a tuple
-                (word_offset, bit_index) inside the packed representation.
+        Union[numpy.ndarray, cupy.ndarray]
+            bit_masks is a uint64 array with shape (num_attributes, num_words)
+            holding packed transaction bits for each item.
 
         Notes
         -----
@@ -369,19 +365,11 @@ class ActionRules:
                 bit_offset = transaction_index % 64
                 bit_masks[attribute_index, word_offset] |= one << self.np.uint64(bit_offset)
 
-        # create lookup table for transactions
-        index_bit_lookup = {}
-        for transaction_index in range(num_transactions):
-            word_offset = transaction_index // 64
-            bit_offset = transaction_index % 64
-        index_bit_lookup[transaction_index] = (word_offset, bit_offset)
-
-        return bit_masks, index_bit_lookup
+        return bit_masks
 
     def _cache_bitset_structures(
         self,
         bit_masks: Union['numpy.ndarray', 'cupy.ndarray'],
-        index_lookup: dict,
         target_items_binding: dict,
         target: str,
     ) -> None:
@@ -392,8 +380,6 @@ class ActionRules:
         ----------
         bit_masks : Union[numpy.ndarray, cupy.ndarray]
             Packed transaction masks for every attribute/value.
-        index_lookup : dict
-            Mapping from transaction index to its (word_offset, bit_offset) location.
         target_items_binding : dict
             Mapping from target attribute name to indices of its one-hot columns.
         target : str
@@ -403,7 +389,6 @@ class ActionRules:
         target_state_bit_masks = {index: bit_masks[index] for index in target_state_indices}
 
         self.bit_masks = bit_masks
-        self.index_bit_lookup = index_lookup
         self.target_state_bit_masks = target_state_bit_masks
 
     def one_hot_encode(
@@ -597,7 +582,6 @@ class ActionRules:
 
         # reset cached bitset structures before fitting a new model
         self.bit_masks = None
-        self.index_bit_lookup = None
         self.target_state_bit_masks = None
         self.frames_bit_masks = None
 
@@ -614,11 +598,9 @@ class ActionRules:
 
         self.intrinsic_utility_table, self.transition_utility_table = self.remap_utility_tables(column_values)
 
-        local_bit_masks = None
-        local_index_lookup = None
         if not use_sparse_matrix:
-            local_bit_masks, local_index_lookup = self.build_bit_masks(data)
-            self._cache_bitset_structures(local_bit_masks, local_index_lookup, target_items_binding, target)
+            local_bit_masks = self.build_bit_masks(data)
+            self._cache_bitset_structures(local_bit_masks, target_items_binding, target)
             self.frames_bit_masks = self.get_split_bit_masks(target_items_binding, target)
 
         if self.verbose:
@@ -641,6 +623,8 @@ class ActionRules:
                 'flexible_items_binding': flexible_items_binding,
                 'undesired_mask': None,
                 'desired_mask': None,
+                'undesired_mask_bitset': None,
+                'desired_mask_bitset': None,
                 'actionable_attributes': 0,
             }
         ]
@@ -657,7 +641,6 @@ class ActionRules:
             frames=frames,
             frames_bit_masks=self.frames_bit_masks if not use_sparse_matrix else None,
             bit_masks=self.bit_masks if not use_sparse_matrix else None,
-            index_bit_lookup=self.index_bit_lookup if not use_sparse_matrix else None,
             min_stable_attributes=self.min_stable_attributes,
             min_flexible_attributes=self.min_flexible_attributes,
             min_undesired_support=self.min_undesired_support,

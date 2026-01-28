@@ -82,7 +82,6 @@ class CandidateGenerator:
         use_sparse_matrix: bool,
         frames_bit_masks: Optional[dict] = None,
         bit_masks: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
-        index_bit_lookup: Optional[dict] = None,
     ):
         """
         Initialize the CandidateGenerator class with the specified parameters.
@@ -115,8 +114,6 @@ class CandidateGenerator:
             Packed bit-mask view of frames keyed by target item index.
         bit_masks : Union[numpy.ndarray, cupy.ndarray], optional
             Packed bit masks for all attributes (as produced by build_bit_masks).
-        index_bit_lookup : dict, optional
-            Mapping from transaction index to (word_offset, bit_offset).
 
         Notes
         -----
@@ -127,7 +124,6 @@ class CandidateGenerator:
         self.frames = frames
         self.frames_bit_masks = frames_bit_masks or {}
         self.bit_masks = bit_masks
-        self.index_bit_lookup = index_bit_lookup
         self.min_stable_attributes = min_stable_attributes
         self.min_flexible_attributes = min_flexible_attributes
         self.min_undesired_support = min_undesired_support
@@ -153,6 +149,8 @@ class CandidateGenerator:
         undesired_state: int,
         desired_state: int,
         verbose: bool = False,
+        undesired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
+        desired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
     ) -> list:
         """
         Generate candidate action rules.
@@ -171,6 +169,10 @@ class CandidateGenerator:
             Mask for the undesired state.
         desired_mask : Union['numpy.ndarray', 'cupy.ndarray', None]
             Mask for the desired state.
+        undesired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
+            Packed bit mask for the undesired branch (intersection so far).
+        desired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
+            Packed bit mask for the desired branch (intersection so far).
         actionable_attributes : int
             Number of actionable attributes.
         stop_list : list
@@ -207,6 +209,17 @@ class CandidateGenerator:
 
         new_branches = []  # type: list
 
+        bitset_undesired_mask = None
+        bitset_desired_mask = None
+        if self.bit_masks is not None and self.frames_bit_masks:
+            base_undesired = self.frames_bit_masks.get(undesired_state)
+            base_desired = self.frames_bit_masks.get(desired_state)
+            if base_undesired is not None and base_desired is not None:
+                bitset_undesired_mask = (
+                    base_undesired if undesired_mask_bitset is None else undesired_mask_bitset
+                )
+                bitset_desired_mask = base_desired if desired_mask_bitset is None else desired_mask_bitset
+
         self.process_stable_candidates(
             ar_prefix,
             itemset_prefix,
@@ -217,6 +230,8 @@ class CandidateGenerator:
             desired_frame,
             new_branches,
             verbose,
+            bitset_undesired_mask,
+            bitset_desired_mask,
         )
         self.process_flexible_candidates(
             ar_prefix,
@@ -230,6 +245,8 @@ class CandidateGenerator:
             actionable_attributes,
             new_branches,
             verbose,
+            undesired_mask_bitset=bitset_undesired_mask,
+            desired_mask_bitset=bitset_desired_mask,
         )
         self.update_new_branches(new_branches, stable_candidates, flexible_candidates)
 
@@ -349,6 +366,8 @@ class CandidateGenerator:
         ],
         new_branches: list,
         verbose: bool,
+        undesired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
+        desired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
     ):
         """
         Process stable candidates to generate new branches.
@@ -371,10 +390,18 @@ class CandidateGenerator:
         desired_frame : Union['numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix',
                               'scipy.sparse.csr_matrix']
             Data frame for the desired state.
+        undesired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
+            Packed mask representing the current undesired branch.
+        desired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
+            Packed mask representing the current desired branch.
         new_branches : list
             List of new branches generated.
         verbose : bool
             If True, enables verbose output.
+        undesired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
+            Packed mask representing the current undesired branch.
+        desired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
+            Packed mask representing the current desired branch.
 
         Notes
         -----
@@ -389,8 +416,12 @@ class CandidateGenerator:
                 if self.in_stop_list(new_ar_prefix, stop_list):
                     continue
 
-                undesired_support = self.get_support(undesired_frame, item)
-                desired_support = self.get_support(desired_frame, item)
+                undesired_support = self.get_support(
+                    undesired_frame, item, mask_bitset=undesired_mask_bitset
+                )
+                desired_support = self.get_support(
+                    desired_frame, item, mask_bitset=desired_mask_bitset
+                )
 
                 if verbose:
                     print('SUPPORT for: ' + str(itemset_prefix + (item,)))
@@ -411,6 +442,8 @@ class CandidateGenerator:
                             'item': item,
                             'undesired_mask': undesired_frame[item],
                             'desired_mask': desired_frame[item],
+                            'undesired_mask_bitset': self._intersect_bit_mask(undesired_mask_bitset, item),
+                            'desired_mask_bitset': self._intersect_bit_mask(desired_mask_bitset, item),
                             'actionable_attributes': 0,
                         }
                     )
@@ -419,6 +452,7 @@ class CandidateGenerator:
         self,
         frame: Union['numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix', 'scipy.sparse.csr_matrix'],
         item: int,
+        mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
     ) -> int:
         """
         Calculate the sum of elements in a specified row of the given frame.
@@ -444,7 +478,49 @@ class CandidateGenerator:
         - Ensure that the `item` index is within the bounds of the frame's rows.
         - For sparse matrices, the sum is computed efficiently by leveraging sparse matrix operations.
         """
-        return int(frame[item].sum())
+        if mask_bitset is not None and self.bit_masks is not None:
+            return self._bitset_support(mask_bitset, item)
+        row = frame[item]
+        if hasattr(row, "sum"):
+            return int(row.sum())
+        import numpy as np
+
+        return int(np.sum(row))
+
+    def _bitset_support(
+        self, mask_bitset: Union['numpy.ndarray', 'cupy.ndarray'], item: int
+    ) -> int:
+        """
+        Compute support using packed bit masks by intersecting with the given mask.
+        """
+        attribute_mask = self.bit_masks[item]  # type: ignore[index]
+        intersection = attribute_mask & mask_bitset
+        return self._popcount(intersection)
+
+    def _intersect_bit_mask(
+        self, current_mask: Optional[Union['numpy.ndarray', 'cupy.ndarray']], item: int
+    ) -> Optional[Union['numpy.ndarray', 'cupy.ndarray']]:
+        """
+        Combine the current packed mask with the mask of the given item.
+        """
+        if current_mask is None or self.bit_masks is None:
+            return None
+        attribute_mask = self.bit_masks[item]
+        return attribute_mask & current_mask
+
+    def _popcount(self, mask: Union['numpy.ndarray', 'cupy.ndarray']) -> int:
+        """
+        Count the number of set bits in the packed mask.
+        """
+        import numpy as np
+
+        if hasattr(mask, "bit_count"):
+            return int(mask.bit_count().sum())  # type: ignore[call-arg]
+        if hasattr(mask, "get"):
+            mask = mask.get()
+        array = np.array(mask, dtype=np.uint64, copy=False).reshape(-1)
+        byte_view = array.view(np.uint8)
+        return int(np.unpackbits(byte_view).sum())
 
     def process_flexible_candidates(
         self,
@@ -463,6 +539,8 @@ class CandidateGenerator:
         actionable_attributes: int,
         new_branches: list,
         verbose: bool,
+        undesired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
+        desired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
     ):
         """
         Process flexible candidates to generate new branches.
@@ -481,6 +559,10 @@ class CandidateGenerator:
             List of stop itemsets.
         flexible_candidates : dict
             Dictionary containing flexible candidates.
+        undesired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
+            Packed mask representing the current undesired branch.
+        desired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
+            Packed mask representing the current desired branch.
         undesired_frame : Union['numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix',
                                 'scipy.sparse.csr_matrix']
             Data frame for the undesired state.
@@ -517,6 +599,8 @@ class CandidateGenerator:
                 desired_frame,
                 flexible_candidates,
                 verbose,
+                undesired_mask_bitset=undesired_mask_bitset,
+                desired_mask_bitset=desired_mask_bitset,
             )
 
             if actionable_attributes == 0 and (undesired_count == 0 or desired_count == 0):
@@ -524,6 +608,8 @@ class CandidateGenerator:
                 stop_list.append(ar_prefix + (attribute,))
             else:
                 for item in items:
+                    next_undesired_bitset = self._intersect_bit_mask(undesired_mask_bitset, item)
+                    next_desired_bitset = self._intersect_bit_mask(desired_mask_bitset, item)
                     new_branches.append(
                         {
                             'ar_prefix': new_ar_prefix,
@@ -531,6 +617,8 @@ class CandidateGenerator:
                             'item': item,
                             'undesired_mask': undesired_frame[item],
                             'desired_mask': desired_frame[item],
+                            'undesired_mask_bitset': next_undesired_bitset,
+                            'desired_mask_bitset': next_desired_bitset,
                             'actionable_attributes': actionable_attributes + 1,
                         }
                     )
@@ -557,6 +645,8 @@ class CandidateGenerator:
         ],
         flexible_candidates: dict,
         verbose: bool,
+        undesired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
+        desired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
     ):
         """
         Process items to generate states and counts.
@@ -579,6 +669,10 @@ class CandidateGenerator:
         desired_frame : Union['numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix',
                               'scipy.sparse.csr_matrix']
             Data frame for the desired state.
+        undesired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
+            Packed mask representing the current undesired branch.
+        desired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
+            Packed mask representing the current desired branch.
         flexible_candidates : dict
             Dictionary containing flexible candidates.
         verbose : bool
@@ -605,8 +699,12 @@ class CandidateGenerator:
             if self.in_stop_list(itemset_prefix + (item,), stop_list_itemset):
                 continue
 
-            undesired_support = self.get_support(undesired_frame, item)
-            desired_support = self.get_support(desired_frame, item)
+            undesired_support = self.get_support(
+                undesired_frame, item, mask_bitset=undesired_mask_bitset
+            )
+            desired_support = self.get_support(
+                desired_frame, item, mask_bitset=desired_mask_bitset
+            )
 
             if verbose:
                 print('SUPPORT for: ' + str(itemset_prefix + (item,)))

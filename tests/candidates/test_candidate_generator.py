@@ -2,8 +2,10 @@
 """Tests for `action_rules` package."""
 
 import numpy as np
+import pandas as pd
 import pytest
 
+from action_rules.action_rules import ActionRules
 from action_rules.candidates.candidate_generator import CandidateGenerator
 from action_rules.rules.rules import Rules
 
@@ -255,6 +257,54 @@ def test_process_items(candidate_generator):
     assert isinstance(desired_states, list)
     assert isinstance(undesired_count, int)
     assert isinstance(desired_count, int)
+
+
+def test_get_support_bitset_parity():
+    """
+    Ensure bitset support matches dense row-sum when a mask is provided.
+    """
+    data = np.array(
+        [
+            [1, 0, 1, 1],
+            [0, 1, 0, 1],
+            [1, 1, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
+    action_rules = ActionRules(
+        min_stable_attributes=1,
+        min_flexible_attributes=1,
+        min_undesired_support=1,
+        min_undesired_confidence=0.5,
+        min_desired_support=1,
+        min_desired_confidence=0.5,
+    )
+    action_rules.set_array_library(use_gpu=False, df=pd.DataFrame({'dummy': [0]}))
+    bit_masks = action_rules.build_bit_masks(data)
+
+    rules = Rules(undesired_state='0', desired_state='1', columns=['col1', 'col2'], count_transactions=4)
+    candidate_generator = CandidateGenerator(
+        frames={0: data, 1: data},
+        min_stable_attributes=1,
+        min_flexible_attributes=1,
+        min_undesired_support=1,
+        min_desired_support=1,
+        min_undesired_confidence=0.5,
+        min_desired_confidence=0.5,
+        undesired_state=0,
+        desired_state=1,
+        rules=rules,
+        use_sparse_matrix=False,
+        bit_masks=bit_masks,
+        frames_bit_masks={0: bit_masks[0], 1: bit_masks[1]},
+    )
+
+    mask_vector = np.array([1, 0, 1, 0], dtype=np.uint8)
+    mask_bitset = action_rules.build_bit_masks(mask_vector.reshape(1, -1))[0]
+
+    item_index = 1
+    expected_dense = int(np.sum(data[item_index] * mask_vector))
+    assert candidate_generator.get_support(data, item_index, mask_bitset=mask_bitset) == expected_dense
 
 
 def test_update_new_branches(candidate_generator):
