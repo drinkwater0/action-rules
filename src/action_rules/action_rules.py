@@ -450,6 +450,7 @@ class ActionRules:
         target_desired_state: str,
         use_sparse_matrix: bool = False,
         use_gpu: bool = False,
+        use_bitset: bool = False,
     ):
         """
         Preprocess and fit the model using one-hot encoded attributes.
@@ -481,6 +482,9 @@ class ActionRules:
         use_gpu : bool, optional
             If True, the GPU (cuDF) is used for data processing if available.
             Default is False.
+        use_bitset : bool, optional
+            If True and not using sparse matrices, build packed bit masks and
+            use the bitset support-counting path. Default is False.
 
         Notes
         -----
@@ -532,6 +536,7 @@ class ActionRules:
             target_desired_state,
             use_sparse_matrix,
             use_gpu,
+            use_bitset,
         )
 
     def fit(
@@ -544,6 +549,7 @@ class ActionRules:
         target_desired_state: str,
         use_sparse_matrix: bool = False,
         use_gpu: bool = False,
+        use_bitset: bool = False,
     ):
         """
         Generate action rules based on the provided dataset and parameters.
@@ -566,6 +572,9 @@ class ActionRules:
             If True, a sparse matrix is used. Default is False.
         use_gpu : bool, optional
             Use GPU (cuDF) for data processing if available. Default is False.
+        use_bitset : bool, optional
+            If True and not using sparse matrices, build packed bit masks and
+            use the bitset support-counting path. Default is False.
 
         Raises
         ------
@@ -598,7 +607,7 @@ class ActionRules:
 
         self.intrinsic_utility_table, self.transition_utility_table = self.remap_utility_tables(column_values)
 
-        if not use_sparse_matrix:
+        if not use_sparse_matrix and use_bitset:
             local_bit_masks = self.build_bit_masks(data)
             self._cache_bitset_structures(local_bit_masks, target_items_binding, target)
             self.frames_bit_masks = self.get_split_bit_masks(target_items_binding, target)
@@ -639,8 +648,8 @@ class ActionRules:
         )
         candidate_generator = CandidateGenerator(
             frames=frames,
-            frames_bit_masks=self.frames_bit_masks if not use_sparse_matrix else None,
-            bit_masks=self.bit_masks if not use_sparse_matrix else None,
+            frames_bit_masks=self.frames_bit_masks if (not use_sparse_matrix and use_bitset) else None,
+            bit_masks=self.bit_masks if (not use_sparse_matrix and use_bitset) else None,
             min_stable_attributes=self.min_stable_attributes,
             min_flexible_attributes=self.min_flexible_attributes,
             min_undesired_support=self.min_undesired_support,
