@@ -333,38 +333,25 @@ class ActionRules:
         """
         if self.np is None:
             raise RuntimeError("Array library is not initialised. Call set_array_library first.")
-
-
-        # get number of attributes and number of transactions
+        # Shape is (num_attributes, num_transactions).
         num_attributes, num_transactions = data.shape
-        # into how many 64-bit words we will separate the transactions bits
         num_words = (num_transactions + 63) // 64
+        padded_transactions = num_words * 64
+        padding = padded_transactions - num_transactions
 
-        # initialize bit masks array to zeros
-        bit_masks = self.np.zeros((num_attributes, num_words), dtype=self.np.uint64)
-        # prepare np and cupy friendly value of 1
-        one = self.np.uint64(1)
+        if padding > 0:
+            pad_block = self.np.zeros((num_attributes, padding), dtype=data.dtype)
+            padded_data = self.np.concatenate((data, pad_block), axis=1)
+        else:
+            padded_data = data
 
-        for attribute_index in range(num_attributes):
-            for transaction_index in range(num_transactions):
+        # Group transactions into 64-bit chunks: (num_attributes, num_words, 64).
+        chunks = padded_data.reshape(num_attributes, num_words, 64).astype(self.np.uint64, copy=False)
+        bit_offsets = self.np.arange(64, dtype=self.np.uint64)
+        bit_weights = self.np.left_shift(self.np.uint64(1), bit_offsets)
 
-                # get one-hot value of attribute in the transaction
-                cell = data[attribute_index, transaction_index]
-                # convert to int if needed
-                if hasattr(cell, "item"):
-                    cell_value = int(cell.item())
-                else:
-                    cell_value = int(cell)
-                
-                # mask is already set to zeros, so skipping
-                if cell_value == 0:
-                    continue
-                
-                # set the corresponding bit in the bit mask
-                word_offset = transaction_index // 64
-                bit_offset = transaction_index % 64
-                bit_masks[attribute_index, word_offset] |= one << self.np.uint64(bit_offset)
-
+        # Pack each 64-sized transaction chunk into one uint64 word.
+        bit_masks = self.np.tensordot(chunks, bit_weights, axes=([2], [0])).astype(self.np.uint64, copy=False)
         return bit_masks
 
     def _cache_bitset_structures(
