@@ -516,9 +516,23 @@ class CandidateGenerator:
 
         if hasattr(mask, "bit_count"):
             return int(mask.bit_count().sum())  # type: ignore[call-arg]
-        if hasattr(mask, "get"):
-            mask = mask.get()
+
+        # Keep popcount on device for CuPy arrays when bit_count is unavailable.
+        if hasattr(mask, "__cuda_array_interface__"):
+            try:
+                import cupy as cp
+            except ImportError:
+                pass
+            else:
+                gpu_array = cp.asarray(mask, dtype=cp.uint64).reshape(-1)
+                if hasattr(cp, "bitwise_count"):
+                    return int(cp.bitwise_count(gpu_array).sum().item())  # type: ignore[attr-defined]
+                byte_view = gpu_array.view(cp.uint8)
+                return int(cp.unpackbits(byte_view).sum().item())
+
         array = np.array(mask, dtype=np.uint64, copy=False).reshape(-1)
+        if hasattr(np, "bitwise_count"):
+            return int(np.bitwise_count(array).sum())  # type: ignore[attr-defined]
         byte_view = array.view(np.uint8)
         return int(np.unpackbits(byte_view).sum())
 
