@@ -261,6 +261,16 @@ class CandidateGenerator:
 
         return new_branches
 
+    @staticmethod
+    def _add_stop_entry(stop_collection, value: tuple) -> None:
+        """
+        Add a stop entry to a list or set without branching at call sites.
+        """
+        if hasattr(stop_collection, "add"):
+            stop_collection.add(value)
+        else:
+            stop_collection.append(value)
+
     def get_frames(
         self,
         undesired_mask: Union[
@@ -466,7 +476,7 @@ class CandidateGenerator:
 
                 if undesired_support < self.min_undesired_support or desired_support < self.min_desired_support:
                     stable_candidates[attribute].remove(item)
-                    stop_list.append(new_ar_prefix)
+                    self._add_stop_entry(stop_list, new_ar_prefix)
                 else:
                     new_branches.append(
                         {
@@ -682,7 +692,7 @@ class CandidateGenerator:
 
             if actionable_attributes == 0 and (undesired_count == 0 or desired_count == 0):
                 del flexible_candidates[attribute]
-                stop_list.append(ar_prefix + (attribute,))
+                self._add_stop_entry(stop_list, ar_prefix + (attribute,))
             else:
                 for item in items:
                     next_undesired_bitset = self._intersect_bit_mask(undesired_mask_bitset, item)
@@ -836,7 +846,7 @@ class CandidateGenerator:
 
             if desired_support < self.min_desired_support and undesired_support < self.min_undesired_support:
                 flexible_candidates[attribute].remove(item)
-                stop_list_itemset.append(itemset_prefix + (item,))
+                self._add_stop_entry(stop_list_itemset, itemset_prefix + (item,))
 
         return undesired_states, desired_states, undesired_count, desired_count
 
@@ -911,6 +921,6 @@ class CandidateGenerator:
         if ar_prefix[-2:] in stop_list:
             return True
         if ar_prefix[1:] in stop_list:
-            stop_list.append(ar_prefix)
+            self._add_stop_entry(stop_list, ar_prefix)
             return True
         return False

@@ -604,12 +604,13 @@ class ActionRules:
             print('_____________________________________________')
             print(self.count_max_nodes(stable_items_binding, flexible_items_binding))
             print('')
-        stop_list = self.get_stop_list(stable_items_binding, flexible_items_binding)
+        # Set membership is hot in candidate pruning; use a set internally for O(1) lookups.
+        stop_list = set(self.get_stop_list(stable_items_binding, flexible_items_binding))
         frames = self.get_split_tables(data, target_items_binding, target, use_sparse_matrix)  
         undesired_state = columns.index(target + '_<item_target>_' + str(target_undesired_state))
         desired_state = columns.index(target + '_<item_target>_' + str(target_desired_state))
 
-        stop_list_itemset = []  # type: list
+        stop_list_itemset = set()  # type: set
 
         candidates_queue = [
             {
