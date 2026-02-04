@@ -203,12 +203,6 @@ class CandidateGenerator:
             k, actionable_attributes, stable_items_binding, flexible_items_binding
         )
 
-        undesired_frame, desired_frame = self.get_frames(undesired_mask, desired_mask, undesired_state, desired_state)
-        stable_candidates = copy.deepcopy(stable_items_binding)
-        flexible_candidates = copy.deepcopy(flexible_items_binding)
-
-        new_branches = []  # type: list
-
         bitset_undesired_mask = None
         bitset_desired_mask = None
         if self.bit_masks is not None and self.frames_bit_masks:
@@ -219,6 +213,21 @@ class CandidateGenerator:
                     base_undesired if undesired_mask_bitset is None else undesired_mask_bitset
                 )
                 bitset_desired_mask = base_desired if desired_mask_bitset is None else desired_mask_bitset
+
+        use_bitset_masks = (
+            self.bit_masks is not None
+            and bitset_undesired_mask is not None
+            and bitset_desired_mask is not None
+        )
+        if use_bitset_masks:
+            # In bitset mode support is computed from packed masks, so avoid dense frame-mask multiplication.
+            undesired_frame, desired_frame = self.get_frames(None, None, undesired_state, desired_state)
+        else:
+            undesired_frame, desired_frame = self.get_frames(undesired_mask, desired_mask, undesired_state, desired_state)
+
+        stable_candidates = copy.deepcopy(stable_items_binding)
+        flexible_candidates = copy.deepcopy(flexible_items_binding)
+        new_branches = []  # type: list
 
         self.process_stable_candidates(
             ar_prefix,
@@ -410,6 +419,11 @@ class CandidateGenerator:
         If the support values meet the minimum thresholds, new branches are created and added to the
         new branches list.
         """
+        use_bitset_masks = (
+            self.bit_masks is not None
+            and undesired_mask_bitset is not None
+            and desired_mask_bitset is not None
+        )
         for attribute, items in reduced_stable_items_binding.items():
             for item in items:
                 new_ar_prefix = ar_prefix + (item,)
@@ -440,8 +454,8 @@ class CandidateGenerator:
                             'ar_prefix': new_ar_prefix,
                             'itemset_prefix': new_ar_prefix,
                             'item': item,
-                            'undesired_mask': undesired_frame[item],
-                            'desired_mask': desired_frame[item],
+                            'undesired_mask': None if use_bitset_masks else undesired_frame[item],
+                            'desired_mask': None if use_bitset_masks else desired_frame[item],
                             'undesired_mask_bitset': self._intersect_bit_mask(undesired_mask_bitset, item),
                             'desired_mask_bitset': self._intersect_bit_mask(desired_mask_bitset, item),
                             'actionable_attributes': 0,
@@ -598,6 +612,11 @@ class CandidateGenerator:
         new branches list. The method also updates the rules with new classification rules if the
         number of actionable attributes meets the minimum required.
         """
+        use_bitset_masks = (
+            self.bit_masks is not None
+            and undesired_mask_bitset is not None
+            and desired_mask_bitset is not None
+        )
         for attribute, items in reduced_flexible_items_binding.items():
             new_ar_prefix = ar_prefix + (attribute,)
             if self.in_stop_list(new_ar_prefix, stop_list):
@@ -629,8 +648,8 @@ class CandidateGenerator:
                             'ar_prefix': new_ar_prefix,
                             'itemset_prefix': itemset_prefix + (item,),
                             'item': item,
-                            'undesired_mask': undesired_frame[item],
-                            'desired_mask': desired_frame[item],
+                            'undesired_mask': None if use_bitset_masks else undesired_frame[item],
+                            'desired_mask': None if use_bitset_masks else desired_frame[item],
                             'undesired_mask_bitset': next_undesired_bitset,
                             'desired_mask_bitset': next_desired_bitset,
                             'actionable_attributes': actionable_attributes + 1,
