@@ -66,6 +66,7 @@ class CandidateGenerator:
     in_stop_list(ar_prefix, stop_list)
         Check if the action rule prefix is in the stop list.
     """
+    _gpu_support_kernel = None
 
     def __init__(
         self,
@@ -548,8 +549,107 @@ class CandidateGenerator:
         """
         if self.bit_masks is None or not items:
             return []
+        if hasattr(mask_bitset, "__cuda_array_interface__"):
+            gpu_counts = self._gpu_bitset_support_batch(mask_bitset, items)
+            if gpu_counts is not None:
+                return gpu_counts
         intersections = self.bit_masks[items] & mask_bitset
         return self._popcount_rows(intersections)
+
+    @classmethod
+    def _get_gpu_support_kernel(cls):
+        """
+        Lazily compile and cache a CUDA kernel for batched AND + popcount support.
+        """
+        if cls._gpu_support_kernel is not None:
+            return cls._gpu_support_kernel
+
+        try:
+            import cupy as cp
+        except ImportError:
+            return None
+
+        kernel_code = r"""
+        extern "C" __global__
+        void bitset_support_kernel(
+            const unsigned long long* item_masks,
+            const unsigned long long* branch_mask,
+            int num_words,
+            unsigned long long* out_support
+        ) {
+            extern __shared__ unsigned int shared_counts[];
+            const int item_index = blockIdx.x;
+            const int thread_id = threadIdx.x;
+            unsigned int local_count = 0u;
+
+            const unsigned long long* row_ptr = item_masks + ((size_t)item_index * (size_t)num_words);
+            for (int word_index = thread_id; word_index < num_words; word_index += blockDim.x) {
+                local_count += (unsigned int)__popcll(row_ptr[word_index] & branch_mask[word_index]);
+            }
+
+            shared_counts[thread_id] = local_count;
+            __syncthreads();
+
+            for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+                if (thread_id < stride) {
+                    shared_counts[thread_id] += shared_counts[thread_id + stride];
+                }
+                __syncthreads();
+            }
+
+            if (thread_id == 0) {
+                out_support[item_index] = (unsigned long long)shared_counts[0];
+            }
+        }
+        """
+
+        try:
+            cls._gpu_support_kernel = cp.RawKernel(kernel_code, "bitset_support_kernel")
+        except Exception:
+            cls._gpu_support_kernel = None
+        return cls._gpu_support_kernel
+
+    def _gpu_bitset_support_batch(
+        self, mask_bitset: Union['numpy.ndarray', 'cupy.ndarray'], items: list
+    ) -> Optional[list[int]]:
+        """
+        Compute batched support on GPU via a custom CUDA kernel when available.
+        """
+        if self.bit_masks is None or not items:
+            return []
+
+        try:
+            import cupy as cp
+        except ImportError:
+            return None
+
+        kernel = self._get_gpu_support_kernel()
+        if kernel is None:
+            return None
+
+        try:
+            item_masks = cp.asarray(self.bit_masks[items], dtype=cp.uint64)
+            if item_masks.ndim == 1:
+                item_masks = item_masks.reshape(1, -1)
+            item_masks = cp.ascontiguousarray(item_masks)
+
+            branch_mask = cp.asarray(mask_bitset, dtype=cp.uint64).reshape(-1)
+            branch_mask = cp.ascontiguousarray(branch_mask)
+
+            num_items, num_words = item_masks.shape
+            supports = cp.zeros(num_items, dtype=cp.uint64)
+
+            threads_per_block = 256
+            shared_mem_bytes = threads_per_block * cp.dtype(cp.uint32).itemsize
+            kernel(
+                (num_items,),
+                (threads_per_block,),
+                (item_masks, branch_mask, int(num_words), supports),
+                shared_mem=shared_mem_bytes,
+            )
+            return [int(value) for value in supports.tolist()]
+        except Exception:
+            return None
 
     def _intersect_bit_mask(
         self, current_mask: Optional[Union['numpy.ndarray', 'cupy.ndarray']], item: int
