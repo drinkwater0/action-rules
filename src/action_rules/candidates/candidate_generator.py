@@ -425,17 +425,36 @@ class CandidateGenerator:
             and desired_mask_bitset is not None
         )
         for attribute, items in reduced_stable_items_binding.items():
+            undesired_supports_by_item = {}
+            desired_supports_by_item = {}
+            if use_bitset_masks:
+                undesired_supports_by_item = {
+                    item_index: support
+                    for item_index, support in zip(
+                        items, self._bitset_support_batch(undesired_mask_bitset, items)  # type: ignore[arg-type]
+                    )
+                }
+                desired_supports_by_item = {
+                    item_index: support
+                    for item_index, support in zip(
+                        items, self._bitset_support_batch(desired_mask_bitset, items)  # type: ignore[arg-type]
+                    )
+                }
             for item in items:
                 new_ar_prefix = ar_prefix + (item,)
                 if self.in_stop_list(new_ar_prefix, stop_list):
                     continue
 
-                undesired_support = self.get_support(
-                    undesired_frame, item, mask_bitset=undesired_mask_bitset
-                )
-                desired_support = self.get_support(
-                    desired_frame, item, mask_bitset=desired_mask_bitset
-                )
+                if use_bitset_masks:
+                    undesired_support = undesired_supports_by_item[item]
+                    desired_support = desired_supports_by_item[item]
+                else:
+                    undesired_support = self.get_support(
+                        undesired_frame, item, mask_bitset=undesired_mask_bitset
+                    )
+                    desired_support = self.get_support(
+                        desired_frame, item, mask_bitset=desired_mask_bitset
+                    )
 
                 if verbose:
                     print('SUPPORT for: ' + str(itemset_prefix + (item,)))
@@ -511,6 +530,17 @@ class CandidateGenerator:
         intersection = attribute_mask & mask_bitset
         return self._popcount(intersection)
 
+    def _bitset_support_batch(
+        self, mask_bitset: Union['numpy.ndarray', 'cupy.ndarray'], items: list
+    ) -> list[int]:
+        """
+        Compute support for multiple items in one packed-mask pass.
+        """
+        if self.bit_masks is None or not items:
+            return []
+        intersections = self.bit_masks[items] & mask_bitset
+        return self._popcount_rows(intersections)
+
     def _intersect_bit_mask(
         self, current_mask: Optional[Union['numpy.ndarray', 'cupy.ndarray']], item: int
     ) -> Optional[Union['numpy.ndarray', 'cupy.ndarray']]:
@@ -526,29 +556,43 @@ class CandidateGenerator:
         """
         Count the number of set bits in the packed mask.
         """
+        return self._popcount_rows(mask)[0]
+
+    def _popcount_rows(self, masks: Union['numpy.ndarray', 'cupy.ndarray']) -> list[int]:
+        """
+        Count set bits row-wise for 1D/2D packed masks.
+        """
         import numpy as np
 
-        if hasattr(mask, "bit_count"):
-            return int(mask.bit_count().sum())  # type: ignore[call-arg]
-
-        # Keep popcount on device for CuPy arrays when bit_count is unavailable.
-        if hasattr(mask, "__cuda_array_interface__"):
+        if hasattr(masks, "__cuda_array_interface__"):
             try:
                 import cupy as cp
             except ImportError:
                 pass
             else:
-                gpu_array = cp.asarray(mask, dtype=cp.uint64).reshape(-1)
+                gpu_masks = cp.asarray(masks, dtype=cp.uint64)
+                if gpu_masks.ndim == 1:
+                    gpu_masks = gpu_masks.reshape(1, -1)
                 if hasattr(cp, "bitwise_count"):
-                    return int(cp.bitwise_count(gpu_array).sum().item())  # type: ignore[attr-defined]
-                byte_view = gpu_array.view(cp.uint8)
-                return int(cp.unpackbits(byte_view).sum().item())
+                    counts = cp.bitwise_count(gpu_masks).sum(axis=1)  # type: ignore[attr-defined]
+                elif hasattr(gpu_masks, "bit_count"):
+                    counts = gpu_masks.bit_count().sum(axis=1)  # type: ignore[call-arg]
+                else:
+                    byte_view = gpu_masks.view(cp.uint8).reshape(gpu_masks.shape[0], -1)
+                    counts = cp.unpackbits(byte_view, axis=1).sum(axis=1)
+                return [int(value) for value in counts.tolist()]
 
-        array = np.array(mask, dtype=np.uint64, copy=False).reshape(-1)
+        array = np.asarray(masks, dtype=np.uint64)
+        if array.ndim == 1:
+            array = array.reshape(1, -1)
         if hasattr(np, "bitwise_count"):
-            return int(np.bitwise_count(array).sum())  # type: ignore[attr-defined]
-        byte_view = array.view(np.uint8)
-        return int(np.unpackbits(byte_view).sum())
+            counts = np.bitwise_count(array).sum(axis=1)  # type: ignore[attr-defined]
+        elif hasattr(array, "bit_count"):
+            counts = array.bit_count().sum(axis=1)  # type: ignore[call-arg]
+        else:
+            byte_view = array.view(np.uint8).reshape(array.shape[0], -1)
+            counts = np.unpackbits(byte_view, axis=1).sum(axis=1)
+        return [int(value) for value in counts.tolist()]
 
     def process_flexible_candidates(
         self,
@@ -727,17 +771,44 @@ class CandidateGenerator:
         desired_states = []
         undesired_count = 0
         desired_count = 0
+        use_bitset_masks = (
+            self.bit_masks is not None
+            and undesired_mask_bitset is not None
+            and desired_mask_bitset is not None
+        )
+        undesired_supports_by_item = {}
+        desired_supports_by_item = {}
+        if use_bitset_masks:
+            active_items = [item for item in items if not self.in_stop_list(itemset_prefix + (item,), stop_list_itemset)]
+            undesired_supports_by_item = {
+                item_index: support
+                for item_index, support in zip(
+                    active_items,
+                    self._bitset_support_batch(undesired_mask_bitset, active_items),  # type: ignore[arg-type]
+                )
+            }
+            desired_supports_by_item = {
+                item_index: support
+                for item_index, support in zip(
+                    active_items,
+                    self._bitset_support_batch(desired_mask_bitset, active_items),  # type: ignore[arg-type]
+                )
+            }
 
         for item in items:
             if self.in_stop_list(itemset_prefix + (item,), stop_list_itemset):
                 continue
 
-            undesired_support = self.get_support(
-                undesired_frame, item, mask_bitset=undesired_mask_bitset
-            )
-            desired_support = self.get_support(
-                desired_frame, item, mask_bitset=desired_mask_bitset
-            )
+            if use_bitset_masks:
+                undesired_support = undesired_supports_by_item[item]
+                desired_support = desired_supports_by_item[item]
+            else:
+                undesired_support = self.get_support(
+                    undesired_frame, item, mask_bitset=undesired_mask_bitset
+                )
+                desired_support = self.get_support(
+                    desired_frame, item, mask_bitset=desired_mask_bitset
+                )
 
             if verbose:
                 print('SUPPORT for: ' + str(itemset_prefix + (item,)))
