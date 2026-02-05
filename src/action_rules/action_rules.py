@@ -438,6 +438,7 @@ class ActionRules:
         use_sparse_matrix: bool = False,
         use_gpu: bool = False,
         use_bitset: bool = False,
+        max_gpu_mem_mb: Optional[int] = None,
     ):
         """
         Preprocess and fit the model using one-hot encoded attributes.
@@ -472,6 +473,9 @@ class ActionRules:
         use_bitset : bool, optional
             If True and not using sparse matrices, build packed bit masks and
             use the bitset support-counting path. Default is False.
+        max_gpu_mem_mb : int, optional
+            Optional GPU memory cap (in MB) for CuPy allocations and bitset
+            support batching. If None, automatic memory-based chunking is used.
 
         Notes
         -----
@@ -524,6 +528,7 @@ class ActionRules:
             use_sparse_matrix,
             use_gpu,
             use_bitset,
+            max_gpu_mem_mb,
         )
 
     def fit(
@@ -537,6 +542,7 @@ class ActionRules:
         use_sparse_matrix: bool = False,
         use_gpu: bool = False,
         use_bitset: bool = False,
+        max_gpu_mem_mb: Optional[int] = None,
     ):
         """
         Generate action rules based on the provided dataset and parameters.
@@ -562,6 +568,9 @@ class ActionRules:
         use_bitset : bool, optional
             If True and not using sparse matrices, build packed bit masks and
             use the bitset support-counting path. Default is False.
+        max_gpu_mem_mb : int, optional
+            Optional GPU memory cap (in MB) for CuPy allocations and bitset
+            support batching. If None, automatic memory-based chunking is used.
 
         Raises
         ------
@@ -580,8 +589,19 @@ class ActionRules:
         self.bit_masks = None
         self.target_state_bit_masks = None
         self.frames_bit_masks = None
+        if max_gpu_mem_mb is not None and max_gpu_mem_mb <= 0:
+            raise ValueError("max_gpu_mem_mb must be a positive integer when provided.")
 
         self.set_array_library(use_gpu, data)
+        previous_gpu_pool_limit = None
+        if self.is_gpu_np and max_gpu_mem_mb is not None:
+            try:
+                gpu_pool = self.np.get_default_memory_pool()  # type: ignore[attr-defined]
+                if hasattr(gpu_pool, "get_limit"):
+                    previous_gpu_pool_limit = int(gpu_pool.get_limit())
+                gpu_pool.set_limit(size=int(max_gpu_mem_mb) * 1024 * 1024)
+            except Exception:
+                previous_gpu_pool_limit = None
         if not self.is_onehot:
             data = self.one_hot_encode(data, stable_attributes, flexible_attributes, target)
         data, columns = self.df_to_array(data, use_sparse_matrix)
@@ -604,9 +624,17 @@ class ActionRules:
             print('_____________________________________________')
             print(self.count_max_nodes(stable_items_binding, flexible_items_binding))
             print('')
+        use_bitset_masks = bool(
+            not use_sparse_matrix and use_bitset and self.bit_masks is not None and self.frames_bit_masks
+        )
+
         # Set membership is hot in candidate pruning; use a set internally for O(1) lookups.
         stop_list = set(self.get_stop_list(stable_items_binding, flexible_items_binding))
-        frames = self.get_split_tables(data, target_items_binding, target, use_sparse_matrix)  
+        if use_bitset_masks:
+            # Bitset mode computes support from packed masks, so dense target-frame slices are unnecessary.
+            frames = {item: None for item in target_items_binding[target]}
+        else:
+            frames = self.get_split_tables(data, target_items_binding, target, use_sparse_matrix)
         undesired_state = columns.index(target + '_<item_target>_' + str(target_undesired_state))
         desired_state = columns.index(target + '_<item_target>_' + str(target_desired_state))
 
@@ -636,8 +664,8 @@ class ActionRules:
         )
         candidate_generator = CandidateGenerator(
             frames=frames,
-            frames_bit_masks=self.frames_bit_masks if (not use_sparse_matrix and use_bitset) else None,
-            bit_masks=self.bit_masks if (not use_sparse_matrix and use_bitset) else None,
+            frames_bit_masks=self.frames_bit_masks if use_bitset_masks else None,
+            bit_masks=self.bit_masks if use_bitset_masks else None,
             min_stable_attributes=self.min_stable_attributes,
             min_flexible_attributes=self.min_flexible_attributes,
             min_undesired_support=self.min_undesired_support,
@@ -648,6 +676,10 @@ class ActionRules:
             desired_state=desired_state,
             rules=self.rules,
             use_sparse_matrix=use_sparse_matrix,
+            gpu_batch_budget_mb=max_gpu_mem_mb,
+            spill_gpu_masks_to_cpu=bool(
+                self.is_gpu_np and (not use_sparse_matrix and use_bitset) and max_gpu_mem_mb is not None
+            ),
         )
         while len(candidates_queue) > 0:
             candidate = candidates_queue.pop(0)
@@ -669,7 +701,13 @@ class ActionRules:
         )
         del data
         if self.is_gpu_np:
-            self.np.get_default_memory_pool().free_all_blocks()  # type: ignore
+            gpu_pool = self.np.get_default_memory_pool()  # type: ignore[attr-defined]
+            gpu_pool.free_all_blocks()
+            if previous_gpu_pool_limit is not None:
+                try:
+                    gpu_pool.set_limit(size=previous_gpu_pool_limit)
+                except Exception:
+                    pass
 
     def get_bindings(
         self,

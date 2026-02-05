@@ -378,6 +378,78 @@ def test_fit_raises_error_when_already_fit(action_rules):
         )
 
 
+def test_fit_rejects_non_positive_max_gpu_mem_mb(action_rules):
+    """
+    Test that fit validates the optional GPU memory cap value.
+    """
+    df = pd.DataFrame({'stable': ['a'], 'flexible': ['x'], 'target': ['yes']})
+    with pytest.raises(ValueError, match="max_gpu_mem_mb must be a positive integer when provided."):
+        action_rules.fit(
+            df,
+            stable_attributes=['stable'],
+            flexible_attributes=['flexible'],
+            target='target',
+            target_undesired_state='no',
+            target_desired_state='yes',
+            max_gpu_mem_mb=0,
+        )
+
+
+def test_fit_passes_max_gpu_mem_mb_to_candidate_generator(action_rules, monkeypatch):
+    """
+    Test that fit forwards the GPU batch memory cap to CandidateGenerator.
+    """
+    captured_kwargs = {}
+
+    class DummyCandidateGenerator:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+        def generate_candidates(self, **kwargs):
+            return []
+
+    monkeypatch.setattr('action_rules.action_rules.CandidateGenerator', DummyCandidateGenerator)
+
+    df = pd.DataFrame({'stable': ['a', 'b'], 'flexible': ['x', 'y'], 'target': ['yes', 'no']})
+    action_rules.fit(
+        df,
+        stable_attributes=['stable'],
+        flexible_attributes=['flexible'],
+        target='target',
+        target_undesired_state='no',
+        target_desired_state='yes',
+        use_bitset=True,
+        max_gpu_mem_mb=256,
+    )
+
+    assert captured_kwargs['gpu_batch_budget_mb'] == 256
+
+
+def test_fit_bitset_skips_split_tables(action_rules, monkeypatch):
+    """
+    Test that bitset mode avoids dense target-frame slicing.
+    """
+
+    def _should_not_be_called(*args, **kwargs):
+        raise AssertionError("get_split_tables should not be called in bitset mode.")
+
+    monkeypatch.setattr(action_rules, 'get_split_tables', _should_not_be_called)
+
+    df = pd.DataFrame({'stable': ['a', 'b'], 'flexible': ['x', 'y'], 'target': ['yes', 'no']})
+    action_rules.fit(
+        df,
+        stable_attributes=['stable'],
+        flexible_attributes=['flexible'],
+        target='target',
+        target_undesired_state='no',
+        target_desired_state='yes',
+        use_bitset=True,
+        use_sparse_matrix=False,
+    )
+
+    assert action_rules.output is not None
+
+
 def test_fit_onehot(action_rules):
     """
     Test the fit_onehot method.

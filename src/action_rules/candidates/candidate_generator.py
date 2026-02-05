@@ -67,6 +67,9 @@ class CandidateGenerator:
         Check if the action rule prefix is in the stop list.
     """
     _gpu_support_kernel = None
+    _gpu_kernel_min_work = 512
+    _gpu_batch_budget_mb = None
+    _gpu_batch_free_mem_fraction = 0.5
 
     def __init__(
         self,
@@ -83,6 +86,9 @@ class CandidateGenerator:
         use_sparse_matrix: bool,
         frames_bit_masks: Optional[dict] = None,
         bit_masks: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
+        gpu_batch_budget_mb: Optional[int] = None,
+        gpu_batch_free_mem_fraction: float = 0.5,
+        spill_gpu_masks_to_cpu: bool = False,
     ):
         """
         Initialize the CandidateGenerator class with the specified parameters.
@@ -115,6 +121,14 @@ class CandidateGenerator:
             Packed bit-mask view of frames keyed by target item index.
         bit_masks : Union[numpy.ndarray, cupy.ndarray], optional
             Packed bit masks for all attributes (as produced by build_bit_masks).
+        gpu_batch_budget_mb : int, optional
+            Optional hard cap (MB) used for GPU batch chunking in bitset support.
+            If None, chunking budget is derived from currently free GPU memory.
+        gpu_batch_free_mem_fraction : float, optional
+            Fraction of free GPU memory considered usable for one support batch.
+        spill_gpu_masks_to_cpu : bool, optional
+            If True, branch masks are moved to CPU after GPU intersections to
+            avoid queue growth in GPU memory under strict memory caps.
 
         Notes
         -----
@@ -135,6 +149,9 @@ class CandidateGenerator:
         self.desired_state = desired_state
         self.rules = rules
         self.use_sparse_matrix = use_sparse_matrix
+        self._gpu_batch_budget_mb = gpu_batch_budget_mb
+        self._gpu_batch_free_mem_fraction = gpu_batch_free_mem_fraction
+        self._spill_gpu_masks_to_cpu = spill_gpu_masks_to_cpu
 
     def generate_candidates(
         self,
@@ -549,12 +566,71 @@ class CandidateGenerator:
         """
         if self.bit_masks is None or not items:
             return []
-        if hasattr(mask_bitset, "__cuda_array_interface__"):
-            gpu_counts = self._gpu_bitset_support_batch(mask_bitset, items)
+        working_mask = mask_bitset
+        if (
+            hasattr(self.bit_masks, "__cuda_array_interface__")
+            and not hasattr(mask_bitset, "__cuda_array_interface__")
+        ):
+            try:
+                import cupy as cp
+
+                working_mask = cp.asarray(mask_bitset, dtype=cp.uint64)
+            except Exception:
+                working_mask = mask_bitset
+
+        if hasattr(working_mask, "__cuda_array_interface__") and self._should_use_gpu_kernel(working_mask, len(items)):
+            gpu_counts = self._gpu_bitset_support_batch(working_mask, items)
             if gpu_counts is not None:
                 return gpu_counts
-        intersections = self.bit_masks[items] & mask_bitset
+        intersections = self.bit_masks[items] & working_mask
         return self._popcount_rows(intersections)
+
+    @classmethod
+    def _should_use_gpu_kernel(cls, mask_bitset, item_count: int) -> bool:
+        """
+        Use the CUDA kernel only when the batch has enough work to amortize launch overhead.
+        """
+        num_words = None
+        try:
+            num_words = int(mask_bitset.size)
+        except Exception:
+            try:
+                shape = getattr(mask_bitset, "shape", None)
+                if shape:
+                    num_words = int(shape[-1])
+            except Exception:
+                pass
+
+        # If size cannot be inferred, prefer kernel path for safety.
+        if num_words is None or num_words <= 0:
+            return True
+        return (item_count * num_words) >= cls._gpu_kernel_min_work
+
+    @classmethod
+    def _compute_gpu_chunk_items(
+        cls,
+        num_words: int,
+        requested_items: int,
+        budget_bytes: int,
+        word_bytes: int = 8,
+    ) -> int:
+        """
+        Compute how many items can be processed in one GPU chunk under a memory budget.
+        """
+        if requested_items <= 0:
+            return 1
+        if num_words <= 0 or budget_bytes <= 0 or word_bytes <= 0:
+            return 1
+
+        # Conservative estimate: item mask load + contiguous conversion + intermediate/output buffers.
+        bytes_per_item = (num_words * word_bytes * 3) + word_bytes
+        if bytes_per_item <= 0:
+            return 1
+
+        chunk_items = budget_bytes // bytes_per_item
+        if chunk_items < 1:
+            return 1
+        return min(requested_items, int(chunk_items))
 
     @classmethod
     def _get_gpu_support_kernel(cls):
@@ -614,6 +690,7 @@ class CandidateGenerator:
     ) -> Optional[list[int]]:
         """
         Compute batched support on GPU via a custom CUDA kernel when available.
+        The item dimension is chunked to keep temporary allocations under a memory budget.
         """
         if self.bit_masks is None or not items:
             return []
@@ -628,26 +705,58 @@ class CandidateGenerator:
             return None
 
         try:
-            item_masks = cp.asarray(self.bit_masks[items], dtype=cp.uint64)
-            if item_masks.ndim == 1:
-                item_masks = item_masks.reshape(1, -1)
-            item_masks = cp.ascontiguousarray(item_masks)
-
             branch_mask = cp.asarray(mask_bitset, dtype=cp.uint64).reshape(-1)
             branch_mask = cp.ascontiguousarray(branch_mask)
-
-            num_items, num_words = item_masks.shape
-            supports = cp.zeros(num_items, dtype=cp.uint64)
-
+            num_words = int(branch_mask.size)
+            total_items = len(items)
             threads_per_block = 256
             shared_mem_bytes = threads_per_block * cp.dtype(cp.uint32).itemsize
-            kernel(
-                (num_items,),
-                (threads_per_block,),
-                (item_masks, branch_mask, int(num_words), supports),
-                shared_mem=shared_mem_bytes,
+            import numpy as np
+
+            budget_bytes = (
+                int(self._gpu_batch_budget_mb * 1024 * 1024)
+                if self._gpu_batch_budget_mb is not None
+                else None
             )
-            return [int(value) for value in supports.tolist()]
+            try:
+                free_bytes, _ = cp.cuda.runtime.memGetInfo()
+                free_mem_budget = int(free_bytes * self._gpu_batch_free_mem_fraction)
+                if free_mem_budget > 0:
+                    budget_bytes = (
+                        free_mem_budget if budget_bytes is None else min(budget_bytes, free_mem_budget)
+                    )
+            except Exception:
+                pass
+
+            if budget_bytes is None:
+                per_item_bytes = (num_words * cp.dtype(cp.uint64).itemsize * 3) + cp.dtype(cp.uint64).itemsize
+                budget_bytes = per_item_bytes * total_items
+
+            chunk_items = self._compute_gpu_chunk_items(
+                num_words=num_words,
+                requested_items=total_items,
+                budget_bytes=int(budget_bytes),
+                word_bytes=cp.dtype(cp.uint64).itemsize,
+            )
+
+            supports_host = np.empty(total_items, dtype=np.int64)
+            for start in range(0, total_items, chunk_items):
+                stop = min(total_items, start + chunk_items)
+                item_masks = cp.asarray(self.bit_masks[items[start:stop]], dtype=cp.uint64)
+                if item_masks.ndim == 1:
+                    item_masks = item_masks.reshape(1, -1)
+                item_masks = cp.ascontiguousarray(item_masks)
+
+                supports = cp.zeros(stop - start, dtype=cp.uint64)
+                kernel(
+                    (stop - start,),
+                    (threads_per_block,),
+                    (item_masks, branch_mask, int(num_words), supports),
+                    shared_mem=shared_mem_bytes,
+                )
+                supports_host[start:stop] = cp.asnumpy(supports).astype(np.int64, copy=False)
+
+            return supports_host.tolist()
         except Exception:
             return None
 
@@ -660,7 +769,26 @@ class CandidateGenerator:
         if current_mask is None or self.bit_masks is None:
             return None
         attribute_mask = self.bit_masks[item]
-        return attribute_mask & current_mask
+        working_mask = current_mask
+        if (
+            hasattr(attribute_mask, "__cuda_array_interface__")
+            and not hasattr(current_mask, "__cuda_array_interface__")
+        ):
+            try:
+                import cupy as cp
+
+                working_mask = cp.asarray(current_mask, dtype=cp.uint64)
+            except Exception:
+                working_mask = current_mask
+        intersection = attribute_mask & working_mask
+        if self._spill_gpu_masks_to_cpu and hasattr(intersection, "__cuda_array_interface__"):
+            try:
+                import cupy as cp
+
+                return cp.asnumpy(intersection)
+            except Exception:
+                return intersection
+        return intersection
 
     def _popcount(self, mask: Union['numpy.ndarray', 'cupy.ndarray']) -> int:
         """
@@ -688,8 +816,13 @@ class CandidateGenerator:
                 elif hasattr(gpu_masks, "bit_count"):
                     counts = gpu_masks.bit_count().sum(axis=1)  # type: ignore[call-arg]
                 else:
-                    byte_view = gpu_masks.view(cp.uint8).reshape(gpu_masks.shape[0], -1)
-                    counts = cp.unpackbits(byte_view, axis=1).sum(axis=1)
+                    # CuPy versions without axis support in unpackbits: fallback to CPU unpackbits.
+                    cpu_masks = cp.asnumpy(gpu_masks)
+                    byte_view = cpu_masks.view(np.uint8).reshape(cpu_masks.shape[0], -1)
+                    counts = np.unpackbits(byte_view, axis=1).sum(axis=1)
+                if hasattr(counts, "__cuda_array_interface__"):
+                    # Keep a single host sync for GPU counts.
+                    return cp.asnumpy(counts).astype(np.int64, copy=False).tolist()
                 return [int(value) for value in counts.tolist()]
 
         array = np.asarray(masks, dtype=np.uint64)

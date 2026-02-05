@@ -307,6 +307,190 @@ def test_get_support_bitset_parity():
     assert candidate_generator.get_support(data, item_index, mask_bitset=mask_bitset) == expected_dense
 
 
+def test_get_support_bitset_batch_parity():
+    """
+    Ensure batched bitset support matches dense row-sums for multiple items.
+    """
+    data = np.array(
+        [
+            [1, 0, 1, 1, 0],
+            [0, 1, 0, 1, 1],
+            [1, 1, 0, 0, 1],
+        ],
+        dtype=np.uint8,
+    )
+    action_rules = ActionRules(
+        min_stable_attributes=1,
+        min_flexible_attributes=1,
+        min_undesired_support=1,
+        min_undesired_confidence=0.5,
+        min_desired_support=1,
+        min_desired_confidence=0.5,
+    )
+    action_rules.set_array_library(use_gpu=False, df=pd.DataFrame({'dummy': [0]}))
+    bit_masks = action_rules.build_bit_masks(data)
+
+    rules = Rules(undesired_state='0', desired_state='1', columns=['col1', 'col2'], count_transactions=5)
+    candidate_generator = CandidateGenerator(
+        frames={0: data, 1: data},
+        min_stable_attributes=1,
+        min_flexible_attributes=1,
+        min_undesired_support=1,
+        min_desired_support=1,
+        min_undesired_confidence=0.5,
+        min_desired_confidence=0.5,
+        undesired_state=0,
+        desired_state=1,
+        rules=rules,
+        use_sparse_matrix=False,
+        bit_masks=bit_masks,
+        frames_bit_masks={0: bit_masks[0], 1: bit_masks[1]},
+    )
+
+    mask_vector = np.array([1, 0, 1, 0, 1], dtype=np.uint8)
+    mask_bitset = action_rules.build_bit_masks(mask_vector.reshape(1, -1))[0]
+    items = [0, 1, 2]
+    expected_dense = [int(np.sum(data[item] * mask_vector)) for item in items]
+
+    assert candidate_generator._bitset_support_batch(mask_bitset, items) == expected_dense
+
+
+def test_get_support_bitset_batch_uses_gpu_dispatch_when_cuda_mask(monkeypatch):
+    """
+    If the branch mask looks like a CUDA array, use the GPU dispatch helper first.
+    """
+
+    class FakeCudaMask:
+        __cuda_array_interface__ = {}
+
+    rules = Rules(undesired_state='0', desired_state='1', columns=['col1'], count_transactions=64)
+    candidate_generator = CandidateGenerator(
+        frames={0: np.array([[1]], dtype=np.uint8), 1: np.array([[1]], dtype=np.uint8)},
+        min_stable_attributes=1,
+        min_flexible_attributes=1,
+        min_undesired_support=1,
+        min_desired_support=1,
+        min_undesired_confidence=0.5,
+        min_desired_confidence=0.5,
+        undesired_state=0,
+        desired_state=1,
+        rules=rules,
+        use_sparse_matrix=False,
+        bit_masks=np.array([[1], [2], [3]], dtype=np.uint64),
+    )
+
+    monkeypatch.setattr(
+        candidate_generator,
+        "_gpu_bitset_support_batch",
+        lambda mask, items: [42 for _ in items],
+    )
+
+    assert candidate_generator._bitset_support_batch(FakeCudaMask(), [0, 2]) == [42, 42]
+
+
+def test_should_use_gpu_kernel_threshold_small_batch(candidate_generator):
+    """
+    Small CUDA-like batches should stay on the vectorized fallback path.
+    """
+
+    class SmallCudaMask:
+        __cuda_array_interface__ = {}
+        size = 2
+
+    assert candidate_generator._should_use_gpu_kernel(SmallCudaMask(), item_count=1) is False
+
+
+def test_should_use_gpu_kernel_unknown_shape_defaults_true(candidate_generator):
+    """
+    If mask size cannot be inferred, prefer kernel path.
+    """
+
+    class UnknownCudaMask:
+        __cuda_array_interface__ = {}
+
+    assert candidate_generator._should_use_gpu_kernel(UnknownCudaMask(), item_count=1) is True
+
+
+def test_compute_gpu_chunk_items_respects_budget(candidate_generator):
+    """
+    Chunk sizing should respect memory budget and requested item count.
+    """
+    num_words = 128
+    requested_items = 100
+    bytes_per_item = (num_words * 8 * 3) + 8
+    budget_bytes = bytes_per_item * 10
+    assert candidate_generator._compute_gpu_chunk_items(num_words, requested_items, budget_bytes) == 10
+
+
+def test_compute_gpu_chunk_items_has_minimum_one(candidate_generator):
+    """
+    Chunk sizing should always return at least one item.
+    """
+    assert candidate_generator._compute_gpu_chunk_items(num_words=256, requested_items=50, budget_bytes=1) == 1
+
+
+def test_generate_candidates_bitset_keeps_branch_masks_packed_only():
+    """
+    In bitset mode, branch expansion should carry packed masks and skip dense row-mask payloads.
+    """
+    data = np.array(
+        [
+            [1, 1, 0, 0],
+            [1, 0, 1, 0],
+        ],
+        dtype=np.uint8,
+    )
+
+    action_rules = ActionRules(
+        min_stable_attributes=1,
+        min_flexible_attributes=1,
+        min_undesired_support=1,
+        min_undesired_confidence=0.5,
+        min_desired_support=1,
+        min_desired_confidence=0.5,
+    )
+    action_rules.set_array_library(use_gpu=False, df=pd.DataFrame({'dummy': [0]}))
+    bit_masks = action_rules.build_bit_masks(data)
+
+    rules = Rules(undesired_state='0', desired_state='1', columns=['col1', 'col2'], count_transactions=4)
+    candidate_generator = CandidateGenerator(
+        frames={0: data, 1: data},
+        min_stable_attributes=1,
+        min_flexible_attributes=1,
+        min_undesired_support=1,
+        min_desired_support=1,
+        min_undesired_confidence=0.5,
+        min_desired_confidence=0.5,
+        undesired_state=0,
+        desired_state=1,
+        rules=rules,
+        use_sparse_matrix=False,
+        bit_masks=bit_masks,
+        frames_bit_masks={0: bit_masks[0], 1: bit_masks[1]},
+    )
+
+    new_branches = candidate_generator.generate_candidates(
+        ar_prefix=(),
+        itemset_prefix=(),
+        stable_items_binding={'stable': [0, 1]},
+        flexible_items_binding={},
+        undesired_mask=None,
+        desired_mask=None,
+        actionable_attributes=0,
+        stop_list=[],
+        stop_list_itemset=[],
+        undesired_state=0,
+        desired_state=1,
+        verbose=False,
+    )
+
+    assert new_branches
+    assert all(branch['undesired_mask'] is None for branch in new_branches)
+    assert all(branch['desired_mask'] is None for branch in new_branches)
+    assert all(branch['undesired_mask_bitset'] is not None for branch in new_branches)
+    assert all(branch['desired_mask_bitset'] is not None for branch in new_branches)
+
+
 def test_update_new_branches(candidate_generator):
     """
     Test the update_new_branches method.
