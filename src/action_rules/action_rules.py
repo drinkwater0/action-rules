@@ -640,7 +640,7 @@ class ActionRules:
 
         stop_list_itemset = set()  # type: set
 
-        candidates_queue = [
+        candidates_stack = [
             {
                 'ar_prefix': tuple(),
                 'itemset_prefix': tuple(),
@@ -653,7 +653,10 @@ class ActionRules:
                 'actionable_attributes': 0,
             }
         ]
-        k = 0
+        pending_depth_counts = {0: 1}
+        min_pending_depth = 0
+        max_depth_seen = 0
+        next_prune_depth = 1
         self.rules = Rules(
             undesired_state,
             desired_state,
@@ -681,11 +684,14 @@ class ActionRules:
                 self.is_gpu_np and (not use_sparse_matrix and use_bitset) and max_gpu_mem_mb is not None
             ),
         )
-        while len(candidates_queue) > 0:
-            candidate = candidates_queue.pop(0)
-            if len(candidate['ar_prefix']) > k:
-                k += 1
-                self.rules.prune_classification_rules(k, stop_list)
+        while len(candidates_stack) > 0:
+            candidate = candidates_stack.pop()
+            depth = len(candidate['ar_prefix'])
+            pending_depth_counts[depth] -= 1
+            if pending_depth_counts[depth] <= 0:
+                pending_depth_counts.pop(depth, None)
+                if depth == min_pending_depth:
+                    min_pending_depth = min(pending_depth_counts.keys(), default=None)
             new_candidates = candidate_generator.generate_candidates(
                 **candidate,
                 stop_list=stop_list,
@@ -694,7 +700,20 @@ class ActionRules:
                 desired_state=desired_state,
                 verbose=self.verbose,
             )
-            candidates_queue += new_candidates
+            if new_candidates:
+                candidates_stack.extend(new_candidates)
+                for new_candidate in new_candidates:
+                    new_depth = len(new_candidate['ar_prefix'])
+                    pending_depth_counts[new_depth] = pending_depth_counts.get(new_depth, 0) + 1
+                    if min_pending_depth is None or new_depth < min_pending_depth:
+                        min_pending_depth = new_depth
+                    if new_depth > max_depth_seen:
+                        max_depth_seen = new_depth
+            while next_prune_depth <= max_depth_seen and (
+                min_pending_depth is None or min_pending_depth >= next_prune_depth
+            ):
+                self.rules.prune_classification_rules(next_prune_depth, stop_list)
+                next_prune_depth += 1
         self.rules.generate_action_rules()
         self.output = Output(
             self.rules.action_rules, target, stable_items_binding, flexible_items_binding, column_values
