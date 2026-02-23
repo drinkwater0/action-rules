@@ -66,6 +66,7 @@ class CandidateGenerator:
         Check if the action rule prefix is in the stop list.
     """
     _gpu_support_kernel = None
+    _gpu_support_kernel_multi = None
     _gpu_kernel_min_work = 512
     _gpu_batch_budget_mb = None
     _gpu_batch_free_mem_fraction = 0.5
@@ -228,21 +229,15 @@ class CandidateGenerator:
 
         bitset_undesired_mask = None
         bitset_desired_mask = None
-        if self.bit_masks is not None and self.frames_bit_masks:
-            base_undesired = self.frames_bit_masks.get(undesired_state)
-            base_desired = self.frames_bit_masks.get(desired_state)
-            if base_undesired is not None and base_desired is not None:
-                bitset_undesired_mask = undesired_mask_bitset
-                bitset_desired_mask = desired_mask_bitset
-                last_item = itemset_prefix[-1] if itemset_prefix else None
-                if bitset_undesired_mask is None and parent_undesired_mask_bitset is not None and last_item is not None:
-                    bitset_undesired_mask = self._intersect_bit_mask(parent_undesired_mask_bitset, last_item)
-                if bitset_desired_mask is None and parent_desired_mask_bitset is not None and last_item is not None:
-                    bitset_desired_mask = self._intersect_bit_mask(parent_desired_mask_bitset, last_item)
-                if bitset_undesired_mask is None:
-                    bitset_undesired_mask = base_undesired
-                if bitset_desired_mask is None:
-                    bitset_desired_mask = base_desired
+        bitset_undesired_mask, bitset_desired_mask = self._resolve_bitset_masks(
+            itemset_prefix,
+            undesired_mask_bitset,
+            desired_mask_bitset,
+            parent_undesired_mask_bitset,
+            parent_desired_mask_bitset,
+            undesired_state,
+            desired_state,
+        )
 
         use_bitset_masks = (
             self.bit_masks is not None
@@ -291,6 +286,334 @@ class CandidateGenerator:
 
         return new_branches
 
+    def generate_candidates_batch(
+        self,
+        candidates: list,
+        stop_list: list,
+        stop_list_itemset: list,
+        undesired_state: int,
+        desired_state: int,
+        verbose: bool = False,
+        batch_size: int = 32,
+    ) -> list:
+        """
+        Generate candidates for a batch of branches, using GPU batching when possible.
+        """
+        if not candidates:
+            return []
+        if verbose:
+            return [
+                new_branch
+                for candidate in candidates
+                for new_branch in self.generate_candidates(
+                    **candidate,
+                    stop_list=stop_list,
+                    stop_list_itemset=stop_list_itemset,
+                    undesired_state=undesired_state,
+                    desired_state=desired_state,
+                    verbose=verbose,
+                )
+            ]
+
+        new_branches_all = []
+        batch_contexts = []
+
+        def flush_batch():
+            nonlocal batch_contexts, new_branches_all
+            if not batch_contexts:
+                return
+
+            def fallback_to_single():
+                nonlocal batch_contexts, new_branches_all
+                for context in batch_contexts:
+                    new_branches_all.extend(
+                        self.generate_candidates(
+                            **context["candidate"],
+                            stop_list=stop_list,
+                            stop_list_itemset=stop_list_itemset,
+                            undesired_state=undesired_state,
+                            desired_state=desired_state,
+                            verbose=verbose,
+                        )
+                    )
+                batch_contexts = []
+
+            try:
+                import cupy as cp
+            except ImportError:
+                fallback_to_single()
+                return
+
+            if not hasattr(self.bit_masks, "__cuda_array_interface__"):
+                fallback_to_single()
+                return
+
+            work_candidate_indices = []
+            work_item_indices = []
+            for ctx_index, context in enumerate(batch_contexts):
+                context["stable_slices"] = []
+                context["flex_slices"] = []
+                for attribute, items in context["reduced_stable_items_binding"].items():
+                    active_items = []
+                    for item in items:
+                        new_ar_prefix = context["ar_prefix"] + (item,)
+                        if self.in_stop_list(new_ar_prefix, stop_list):
+                            continue
+                        active_items.append(item)
+                    if not active_items:
+                        continue
+                    start = len(work_item_indices)
+                    work_item_indices.extend(active_items)
+                    work_candidate_indices.extend([ctx_index] * len(active_items))
+                    context["stable_slices"].append((attribute, active_items, start))
+
+                for attribute, items in context["reduced_flexible_items_binding"].items():
+                    new_ar_prefix = context["ar_prefix"] + (attribute,)
+                    if self.in_stop_list(new_ar_prefix, stop_list):
+                        continue
+                    active_items = []
+                    for item in items:
+                        if self.in_stop_list(context["itemset_prefix"] + (item,), stop_list_itemset):
+                            continue
+                        active_items.append(item)
+                    if not active_items:
+                        continue
+                    start = len(work_item_indices)
+                    work_item_indices.extend(active_items)
+                    work_candidate_indices.extend([ctx_index] * len(active_items))
+                    context["flex_slices"].append((attribute, active_items, start))
+
+            if not work_item_indices:
+                batch_contexts = []
+                return
+
+            try:
+                branch_masks_a = cp.stack(
+                    [
+                        cp.asarray(context["bitset_undesired_mask"], dtype=cp.uint64).reshape(-1)
+                        for context in batch_contexts
+                    ],
+                    axis=0,
+                )
+                branch_masks_b = cp.stack(
+                    [
+                        cp.asarray(context["bitset_desired_mask"], dtype=cp.uint64).reshape(-1)
+                        for context in batch_contexts
+                    ],
+                    axis=0,
+                )
+            except Exception:
+                fallback_to_single()
+                return
+
+            supports = self._gpu_bitset_support_batch_multi(
+                branch_masks_a,
+                branch_masks_b,
+                work_candidate_indices,
+                work_item_indices,
+            )
+            if supports is None:
+                fallback_to_single()
+                return
+
+            undesired_supports_all, desired_supports_all = supports
+            for context in batch_contexts:
+                new_branches = []
+                stable_candidates = context["stable_candidates"]
+                flexible_candidates = context["flexible_candidates"]
+
+                for attribute, items, start in context["stable_slices"]:
+                    for offset, item in enumerate(items):
+                        new_ar_prefix = context["ar_prefix"] + (item,)
+                        if self.in_stop_list(new_ar_prefix, stop_list):
+                            continue
+                        index = start + offset
+                        undesired_support = undesired_supports_all[index]
+                        desired_support = desired_supports_all[index]
+                        if (
+                            undesired_support < self.min_undesired_support
+                            or desired_support < self.min_desired_support
+                        ):
+                            stable_candidates[attribute].remove(item)
+                            self._add_stop_entry(stop_list, new_ar_prefix)
+                        else:
+                            new_branches.append(
+                                {
+                                    "ar_prefix": new_ar_prefix,
+                                    "itemset_prefix": new_ar_prefix,
+                                    "item": item,
+                                    "undesired_mask": None,
+                                    "desired_mask": None,
+                                    "undesired_mask_bitset": None,
+                                    "desired_mask_bitset": None,
+                                    "parent_undesired_mask_bitset": context["bitset_undesired_mask"],
+                                    "parent_desired_mask_bitset": context["bitset_desired_mask"],
+                                    "actionable_attributes": 0,
+                                }
+                            )
+
+                for attribute, items, start in context["flex_slices"]:
+                    new_ar_prefix = context["ar_prefix"] + (attribute,)
+                    if self.in_stop_list(new_ar_prefix, stop_list):
+                        continue
+                    undesired_states = []
+                    desired_states = []
+                    undesired_count = 0
+                    desired_count = 0
+                    kept_items = []
+                    for offset, item in enumerate(items):
+                        if self.in_stop_list(
+                            context["itemset_prefix"] + (item,), stop_list_itemset
+                        ):
+                            continue
+                        index = start + offset
+                        undesired_support = undesired_supports_all[index]
+                        desired_support = desired_supports_all[index]
+
+                        undesired_conf = self.rules.calculate_confidence(
+                            undesired_support, desired_support
+                        )
+                        if undesired_support >= self.min_undesired_support:
+                            undesired_count += 1
+                            if undesired_conf >= self.min_undesired_confidence:
+                                undesired_states.append(
+                                    {
+                                        "item": item,
+                                        "support": undesired_support,
+                                        "confidence": undesired_conf,
+                                    }
+                                )
+                            else:
+                                self.rules.add_prefix_without_conf(new_ar_prefix, False)
+
+                        desired_conf = self.rules.calculate_confidence(
+                            desired_support, undesired_support
+                        )
+                        if desired_support >= self.min_desired_support:
+                            desired_count += 1
+                            if desired_conf >= self.min_desired_confidence:
+                                desired_states.append(
+                                    {
+                                        "item": item,
+                                        "support": desired_support,
+                                        "confidence": desired_conf,
+                                    }
+                                )
+                            else:
+                                self.rules.add_prefix_without_conf(new_ar_prefix, True)
+
+                        if (
+                            desired_support < self.min_desired_support
+                            and undesired_support < self.min_undesired_support
+                        ):
+                            flexible_candidates[attribute].remove(item)
+                            self._add_stop_entry(
+                                stop_list_itemset, context["itemset_prefix"] + (item,)
+                            )
+                            continue
+
+                        kept_items.append(item)
+
+                    if context["actionable_attributes"] == 0 and (
+                        undesired_count == 0 or desired_count == 0
+                    ):
+                        del flexible_candidates[attribute]
+                        self._add_stop_entry(stop_list, context["ar_prefix"] + (attribute,))
+                    else:
+                        for item in kept_items:
+                            new_branches.append(
+                                {
+                                    "ar_prefix": new_ar_prefix,
+                                    "itemset_prefix": context["itemset_prefix"] + (item,),
+                                    "item": item,
+                                    "undesired_mask": None,
+                                    "desired_mask": None,
+                                    "undesired_mask_bitset": None,
+                                    "desired_mask_bitset": None,
+                                    "parent_undesired_mask_bitset": context["bitset_undesired_mask"],
+                                    "parent_desired_mask_bitset": context["bitset_desired_mask"],
+                                    "actionable_attributes": context["actionable_attributes"] + 1,
+                                }
+                            )
+                        if context["actionable_attributes"] + 1 >= self.min_flexible_attributes:
+                            self.rules.add_classification_rules(
+                                new_ar_prefix,
+                                context["itemset_prefix"],
+                                undesired_states,
+                                desired_states,
+                            )
+
+                self.update_new_branches(new_branches, stable_candidates, flexible_candidates)
+                new_branches_all.extend(new_branches)
+
+            batch_contexts = []
+
+        for candidate in candidates:
+            bitset_undesired_mask, bitset_desired_mask = self._resolve_bitset_masks(
+                candidate.get("itemset_prefix", tuple()),
+                candidate.get("undesired_mask_bitset"),
+                candidate.get("desired_mask_bitset"),
+                candidate.get("parent_undesired_mask_bitset"),
+                candidate.get("parent_desired_mask_bitset"),
+                undesired_state,
+                desired_state,
+            )
+            use_bitset_masks = (
+                self.bit_masks is not None
+                and bitset_undesired_mask is not None
+                and bitset_desired_mask is not None
+            )
+            if not use_bitset_masks:
+                flush_batch()
+                new_branches_all.extend(
+                    self.generate_candidates(
+                        **candidate,
+                        stop_list=stop_list,
+                        stop_list_itemset=stop_list_itemset,
+                        undesired_state=undesired_state,
+                        desired_state=desired_state,
+                        verbose=verbose,
+                    )
+                )
+                continue
+
+            k = len(candidate["itemset_prefix"]) + 1
+            reduced_stable_items_binding, reduced_flexible_items_binding = (
+                self.reduce_candidates_by_min_attributes(
+                    k,
+                    candidate["actionable_attributes"],
+                    candidate["stable_items_binding"],
+                    candidate["flexible_items_binding"],
+                )
+            )
+            stable_candidates = {
+                attribute: list(items)
+                for attribute, items in candidate["stable_items_binding"].items()
+            }
+            flexible_candidates = {
+                attribute: list(items)
+                for attribute, items in candidate["flexible_items_binding"].items()
+            }
+            batch_contexts.append(
+                {
+                    "candidate": candidate,
+                    "ar_prefix": candidate["ar_prefix"],
+                    "itemset_prefix": candidate["itemset_prefix"],
+                    "reduced_stable_items_binding": reduced_stable_items_binding,
+                    "reduced_flexible_items_binding": reduced_flexible_items_binding,
+                    "stable_candidates": stable_candidates,
+                    "flexible_candidates": flexible_candidates,
+                    "bitset_undesired_mask": bitset_undesired_mask,
+                    "bitset_desired_mask": bitset_desired_mask,
+                    "actionable_attributes": candidate["actionable_attributes"],
+                }
+            )
+            if batch_size > 0 and len(batch_contexts) >= batch_size:
+                flush_batch()
+
+        flush_batch()
+        return new_branches_all
+
     @staticmethod
     def _add_stop_entry(stop_collection, value: tuple) -> None:
         """
@@ -300,6 +623,36 @@ class CandidateGenerator:
             stop_collection.add(value)
         else:
             stop_collection.append(value)
+
+    def _resolve_bitset_masks(
+        self,
+        itemset_prefix: tuple,
+        undesired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']],
+        desired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']],
+        parent_undesired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']],
+        parent_desired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']],
+        undesired_state: int,
+        desired_state: int,
+    ) -> tuple:
+        if self.bit_masks is None or not self.frames_bit_masks:
+            return None, None
+        base_undesired = self.frames_bit_masks.get(undesired_state)
+        base_desired = self.frames_bit_masks.get(desired_state)
+        if base_undesired is None or base_desired is None:
+            return None, None
+
+        bitset_undesired_mask = undesired_mask_bitset
+        bitset_desired_mask = desired_mask_bitset
+        last_item = itemset_prefix[-1] if itemset_prefix else None
+        if bitset_undesired_mask is None and parent_undesired_mask_bitset is not None and last_item is not None:
+            bitset_undesired_mask = self._intersect_bit_mask(parent_undesired_mask_bitset, last_item)
+        if bitset_desired_mask is None and parent_desired_mask_bitset is not None and last_item is not None:
+            bitset_desired_mask = self._intersect_bit_mask(parent_desired_mask_bitset, last_item)
+        if bitset_undesired_mask is None:
+            bitset_undesired_mask = base_undesired
+        if bitset_desired_mask is None:
+            bitset_desired_mask = base_desired
+        return bitset_undesired_mask, bitset_desired_mask
 
     def get_frames(
         self,
@@ -634,7 +987,10 @@ class CandidateGenerator:
             except Exception:
                 working_mask = mask_bitset
 
-        if hasattr(working_mask, "__cuda_array_interface__") and self._should_use_gpu_kernel(working_mask, len(items)):
+        use_gpu_kernel = False
+        if hasattr(working_mask, "__cuda_array_interface__"):
+            use_gpu_kernel = self._should_use_gpu_kernel(working_mask, len(items))
+        if use_gpu_kernel:
             gpu_counts = self._gpu_bitset_support_batch(working_mask, items)
             if gpu_counts is not None:
                 return gpu_counts
@@ -744,6 +1100,186 @@ class CandidateGenerator:
         except Exception:
             cls._gpu_support_kernel = None
         return cls._gpu_support_kernel
+
+    @classmethod
+    def _get_gpu_support_kernel_multi(cls):
+        """
+        Lazily compile and cache a CUDA kernel for multi-branch batched support.
+        """
+        if cls._gpu_support_kernel_multi is not None:
+            return cls._gpu_support_kernel_multi
+
+        try:
+            import cupy as cp
+        except ImportError:
+            return None
+
+        kernel_code = r"""
+        extern "C" __global__
+        void bitset_support_kernel_multi(
+            const unsigned long long* item_masks,
+            const unsigned long long* branch_masks_a,
+            const unsigned long long* branch_masks_b,
+            const int* candidate_indices,
+            const long long* item_indices,
+            int num_words,
+            unsigned long long* out_support_a,
+            unsigned long long* out_support_b
+        ) {
+            extern __shared__ unsigned int shared_counts[];
+            const int work_index = blockIdx.x;
+            const int thread_id = threadIdx.x;
+
+            const int candidate_index = candidate_indices[work_index];
+            const long long item_index = item_indices[work_index];
+            const unsigned long long* row_ptr =
+                item_masks + ((size_t)item_index * (size_t)num_words);
+            const unsigned long long* branch_a =
+                branch_masks_a + ((size_t)candidate_index * (size_t)num_words);
+            const unsigned long long* branch_b =
+                branch_masks_b + ((size_t)candidate_index * (size_t)num_words);
+
+            unsigned int local_count_a = 0u;
+            unsigned int local_count_b = 0u;
+            for (int word_index = thread_id; word_index < num_words; word_index += blockDim.x) {
+                unsigned long long word = row_ptr[word_index];
+                local_count_a += (unsigned int)__popcll(word & branch_a[word_index]);
+                local_count_b += (unsigned int)__popcll(word & branch_b[word_index]);
+            }
+
+            unsigned int* shared_a = shared_counts;
+            unsigned int* shared_b = shared_counts + blockDim.x;
+            shared_a[thread_id] = local_count_a;
+            shared_b[thread_id] = local_count_b;
+            __syncthreads();
+
+            for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+                if (thread_id < stride) {
+                    shared_a[thread_id] += shared_a[thread_id + stride];
+                    shared_b[thread_id] += shared_b[thread_id + stride];
+                }
+                __syncthreads();
+            }
+
+            if (thread_id == 0) {
+                out_support_a[work_index] = (unsigned long long)shared_a[0];
+                out_support_b[work_index] = (unsigned long long)shared_b[0];
+            }
+        }
+        """
+
+        try:
+            cls._gpu_support_kernel_multi = cp.RawKernel(
+                kernel_code, "bitset_support_kernel_multi"
+            )
+        except Exception:
+            cls._gpu_support_kernel_multi = None
+        return cls._gpu_support_kernel_multi
+
+    def _gpu_bitset_support_batch_multi(
+        self,
+        branch_masks_a: Union['numpy.ndarray', 'cupy.ndarray'],
+        branch_masks_b: Union['numpy.ndarray', 'cupy.ndarray'],
+        work_candidate_indices: list,
+        work_item_indices: list,
+    ) -> Optional[tuple[list[int], list[int]]]:
+        """
+        Compute support for a worklist across multiple branch masks in one kernel.
+        """
+        if self.bit_masks is None or not work_item_indices:
+            return None
+
+        try:
+            import cupy as cp
+            import numpy as np
+        except ImportError:
+            return None
+
+        if not hasattr(self.bit_masks, "__cuda_array_interface__"):
+            return None
+
+        kernel = self._get_gpu_support_kernel_multi()
+        if kernel is None:
+            return None
+
+        try:
+            branch_masks_a = cp.asarray(branch_masks_a, dtype=cp.uint64)
+            branch_masks_b = cp.asarray(branch_masks_b, dtype=cp.uint64)
+            branch_masks_a = cp.ascontiguousarray(branch_masks_a)
+            branch_masks_b = cp.ascontiguousarray(branch_masks_b)
+            if branch_masks_a.shape != branch_masks_b.shape:
+                return None
+            if branch_masks_a.ndim != 2:
+                return None
+
+            num_words = int(branch_masks_a.shape[1])
+            if num_words <= 0:
+                return None
+
+            total_items = len(work_item_indices)
+            if not self._should_use_gpu_kernel(branch_masks_a, total_items):
+                return None
+
+            threads_per_block = 256
+            shared_mem_bytes = threads_per_block * cp.dtype(cp.uint32).itemsize * 2
+
+            budget_bytes = (
+                int(self._gpu_batch_budget_mb * 1024 * 1024)
+                if self._gpu_batch_budget_mb is not None
+                else None
+            )
+            try:
+                free_bytes, _ = cp.cuda.runtime.memGetInfo()
+                free_mem_budget = int(free_bytes * self._gpu_batch_free_mem_fraction)
+                if free_mem_budget > 0:
+                    budget_bytes = (
+                        free_mem_budget if budget_bytes is None else min(budget_bytes, free_mem_budget)
+                    )
+            except Exception:
+                pass
+
+            bytes_per_item = 2 * cp.dtype(cp.uint64).itemsize
+            if budget_bytes is None or budget_bytes <= 0:
+                chunk_items = total_items
+            else:
+                chunk_items = budget_bytes // bytes_per_item
+                if chunk_items < 1:
+                    chunk_items = 1
+                if chunk_items > total_items:
+                    chunk_items = total_items
+
+            supports_host_a = np.empty(total_items, dtype=np.int64)
+            supports_host_b = np.empty(total_items, dtype=np.int64)
+            for start in range(0, total_items, chunk_items):
+                stop = min(total_items, start + chunk_items)
+                chunk_len = stop - start
+                candidate_indices = cp.asarray(
+                    work_candidate_indices[start:stop], dtype=cp.int32
+                )
+                item_indices = cp.asarray(work_item_indices[start:stop], dtype=cp.int64)
+                supports_a = cp.zeros(chunk_len, dtype=cp.uint64)
+                supports_b = cp.zeros(chunk_len, dtype=cp.uint64)
+                kernel(
+                    (chunk_len,),
+                    (threads_per_block,),
+                    (
+                        self.bit_masks,
+                        branch_masks_a,
+                        branch_masks_b,
+                        candidate_indices,
+                        item_indices,
+                        int(num_words),
+                        supports_a,
+                        supports_b,
+                    ),
+                    shared_mem=shared_mem_bytes,
+                )
+                supports_host_a[start:stop] = cp.asnumpy(supports_a).astype(np.int64, copy=False)
+                supports_host_b[start:stop] = cp.asnumpy(supports_b).astype(np.int64, copy=False)
+
+            return supports_host_a.tolist(), supports_host_b.tolist()
+        except Exception:
+            return None
 
     def _gpu_bitset_support_batch(
         self, mask_bitset: Union['numpy.ndarray', 'cupy.ndarray'], items: list
