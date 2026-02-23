@@ -439,6 +439,7 @@ class ActionRules:
         use_gpu: bool = False,
         use_bitset: bool = False,
         max_gpu_mem_mb: Optional[int] = None,
+        gpu_batch_size: Optional[int] = None,
     ):
         """
         Preprocess and fit the model using one-hot encoded attributes.
@@ -476,6 +477,9 @@ class ActionRules:
         max_gpu_mem_mb : int, optional
             Optional GPU memory cap (in MB) for CuPy allocations and bitset
             support batching. If None, automatic memory-based chunking is used.
+        gpu_batch_size : int, optional
+            Optional number of candidate contexts processed per GPU bitset batch.
+            If None, defaults to 32 on the GPU bitset path.
 
         Notes
         -----
@@ -529,6 +533,7 @@ class ActionRules:
             use_gpu,
             use_bitset,
             max_gpu_mem_mb,
+            gpu_batch_size,
         )
 
     def fit(
@@ -543,6 +548,7 @@ class ActionRules:
         use_gpu: bool = False,
         use_bitset: bool = False,
         max_gpu_mem_mb: Optional[int] = None,
+        gpu_batch_size: Optional[int] = None,
     ):
         """
         Generate action rules based on the provided dataset and parameters.
@@ -571,6 +577,9 @@ class ActionRules:
         max_gpu_mem_mb : int, optional
             Optional GPU memory cap (in MB) for CuPy allocations and bitset
             support batching. If None, automatic memory-based chunking is used.
+        gpu_batch_size : int, optional
+            Optional number of candidate contexts processed per GPU bitset batch.
+            If None, defaults to 32 on the GPU bitset path.
 
         Raises
         ------
@@ -684,11 +693,11 @@ class ActionRules:
                 self.is_gpu_np and (not use_sparse_matrix and use_bitset) and max_gpu_mem_mb is not None
             ),
         )
-        gpu_batch_size = 32 if (self.is_gpu_np and use_bitset_masks) else 1
+        effective_gpu_batch_size = gpu_batch_size if gpu_batch_size is not None else 32
         while len(candidates_stack) > 0:
             if self.is_gpu_np and use_bitset_masks:
                 batch = []
-                while candidates_stack and len(batch) < gpu_batch_size:
+                while candidates_stack and len(batch) < effective_gpu_batch_size:
                     candidate = candidates_stack.pop()
                     depth = len(candidate['ar_prefix'])
                     pending_depth_counts[depth] -= 1
@@ -704,7 +713,7 @@ class ActionRules:
                     undesired_state=undesired_state,
                     desired_state=desired_state,
                     verbose=self.verbose,
-                    batch_size=gpu_batch_size,
+                    batch_size=effective_gpu_batch_size,
                 )
             else:
                 candidate = candidates_stack.pop()
