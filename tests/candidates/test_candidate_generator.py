@@ -242,7 +242,13 @@ def test_process_items(candidate_generator):
     desired_frame = np.array([[0, 1], [1, 0]])
     flexible_candidates = {'attr3': [0, 1]}
     verbose = False
-    undesired_states, desired_states, undesired_count, desired_count = candidate_generator.process_items(
+    (
+        undesired_states,
+        desired_states,
+        undesired_count,
+        desired_count,
+        kept_items,
+    ) = candidate_generator.process_items(
         attribute,
         items,
         itemset_prefix,
@@ -257,6 +263,7 @@ def test_process_items(candidate_generator):
     assert isinstance(desired_states, list)
     assert isinstance(undesired_count, int)
     assert isinstance(desired_count, int)
+    assert isinstance(kept_items, list)
 
 
 def test_get_support_bitset_parity():
@@ -431,7 +438,8 @@ def test_compute_gpu_chunk_items_has_minimum_one(candidate_generator):
 
 def test_generate_candidates_bitset_keeps_branch_masks_packed_only():
     """
-    In bitset mode, branch expansion should carry packed masks and skip dense row-mask payloads.
+    In bitset mode, branch expansion should keep dense row masks empty and
+    carry packed branch state lazily via parent bitset masks.
     """
     data = np.array(
         [
@@ -487,8 +495,10 @@ def test_generate_candidates_bitset_keeps_branch_masks_packed_only():
     assert new_branches
     assert all(branch['undesired_mask'] is None for branch in new_branches)
     assert all(branch['desired_mask'] is None for branch in new_branches)
-    assert all(branch['undesired_mask_bitset'] is not None for branch in new_branches)
-    assert all(branch['desired_mask_bitset'] is not None for branch in new_branches)
+    assert all(branch['undesired_mask_bitset'] is None for branch in new_branches)
+    assert all(branch['desired_mask_bitset'] is None for branch in new_branches)
+    assert all(branch['parent_undesired_mask_bitset'] is not None for branch in new_branches)
+    assert all(branch['parent_desired_mask_bitset'] is not None for branch in new_branches)
 
 
 def test_update_new_branches(candidate_generator):
