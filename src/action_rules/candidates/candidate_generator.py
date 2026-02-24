@@ -6,19 +6,19 @@ from action_rules.rules import Rules
 
 if TYPE_CHECKING:
     import cupy
-    import cupyx
     import numpy
-    import scipy
 
 
 class CandidateGenerator:
     """
-    A class used to generate candidate action rules for a given dataset.
+    Generate candidate branches for bitset-based action-rule mining.
 
     Attributes
     ----------
-    frames : dict
-        Dictionary containing data frames for undesired and desired states.
+    frames_bit_masks : dict
+        Packed target-state masks keyed by target item index.
+    bit_masks : Union[numpy.ndarray, cupy.ndarray]
+        Packed masks for all one-hot items.
     min_stable_attributes : int
         Minimum number of stable attributes required.
     min_flexible_attributes : int
@@ -37,28 +37,23 @@ class CandidateGenerator:
         The desired state of the target attribute.
     rules : Rules
         Rules object to store the generated classification rules.
-    use_sparse_matrix : bool
-        If True, sparse matrices are used for calculations.
 
     Methods
     -------
-    generate_candidates(ar_prefix, itemset_prefix, stable_items_binding, flexible_items_binding, undesired_mask,
-                        desired_mask, actionable_attributes, stop_list, stop_list_itemset, undesired_state,
+    generate_candidates(ar_prefix, itemset_prefix, stable_items_binding, flexible_items_binding,
+                        actionable_attributes, stop_list, stop_list_itemset, undesired_state,
                         desired_state, verbose=False)
         Generate candidate action rules.
-    get_frames(undesired_mask, desired_mask, undesired_state, desired_state)
-        Get the frames for the undesired and desired states.
     reduce_candidates_by_min_attributes(k, actionable_attributes, stable_items_binding, flexible_items_binding)
         Reduce the candidate sets based on minimum attributes.
     process_stable_candidates(ar_prefix, itemset_prefix, reduced_stable_items_binding, stop_list, stable_candidates,
-                              undesired_frame, desired_frame, new_branches, verbose)
+                              new_branches, verbose)
         Process stable candidates to generate new branches.
     process_flexible_candidates(ar_prefix, itemset_prefix, reduced_flexible_items_binding, stop_list, stop_list_itemset,
-                                flexible_candidates, undesired_frame, desired_frame, actionable_attributes,
+                                flexible_candidates, actionable_attributes,
                                 new_branches, verbose)
         Process flexible candidates to generate new branches.
-    process_items(attribute, items, itemset_prefix, stop_list_itemset, undesired_frame, desired_frame,
-                  flexible_candidates, verbose)
+    process_items(attribute, items, itemset_prefix, stop_list_itemset, flexible_candidates, verbose)
         Process items to generate states and counts.
     update_new_branches(new_branches, stable_candidates, flexible_candidates)
         Update new branches with stable and flexible candidates.
@@ -73,7 +68,6 @@ class CandidateGenerator:
 
     def __init__(
         self,
-        frames: dict,
         min_stable_attributes: int,
         min_flexible_attributes: int,
         min_undesired_support: int,
@@ -83,7 +77,6 @@ class CandidateGenerator:
         undesired_state: int,
         desired_state: int,
         rules: Rules,
-        use_sparse_matrix: bool,
         frames_bit_masks: Optional[dict] = None,
         bit_masks: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
         gpu_batch_budget_mb: Optional[int] = None,
@@ -95,8 +88,6 @@ class CandidateGenerator:
 
         Parameters
         ----------
-        frames : dict
-            Dictionary containing data frames for undesired and desired states.
         min_stable_attributes : int
             Minimum number of stable attributes required.
         min_flexible_attributes : int
@@ -115,8 +106,6 @@ class CandidateGenerator:
             The desired state of the target attribute.
         rules : Rules
             Rules object to store the generated classification rules.
-        use_sparse_matrix : bool, optional
-            If True, sparse matrices are used. Default is False.
         frames_bit_masks : dict, optional
             Packed bit-mask view of frames keyed by target item index.
         bit_masks : Union[numpy.ndarray, cupy.ndarray], optional
@@ -134,9 +123,8 @@ class CandidateGenerator:
         -----
         The CandidateGenerator class is designed to facilitate the generation of candidate action rules by
         iterating over combinations of stable and flexible attributes. The class maintains a reference to the
-        rules object where generated rules are stored and supports both dense and sparse matrix operations.
+        rules object where generated rules are stored.
         """
-        self.frames = frames
         self.frames_bit_masks = frames_bit_masks or {}
         self.bit_masks = bit_masks
         self.min_stable_attributes = min_stable_attributes
@@ -148,7 +136,6 @@ class CandidateGenerator:
         self.undesired_state = undesired_state
         self.desired_state = desired_state
         self.rules = rules
-        self.use_sparse_matrix = use_sparse_matrix
         self._gpu_batch_budget_mb = gpu_batch_budget_mb
         self._gpu_batch_free_mem_fraction = gpu_batch_free_mem_fraction
         self._spill_gpu_masks_to_cpu = spill_gpu_masks_to_cpu
@@ -159,8 +146,6 @@ class CandidateGenerator:
         itemset_prefix: tuple,
         stable_items_binding: dict,
         flexible_items_binding: dict,
-        undesired_mask: Union['numpy.ndarray', 'cupy.ndarray', None],
-        desired_mask: Union['numpy.ndarray', 'cupy.ndarray', None],
         actionable_attributes: int,
         stop_list: list,
         stop_list_itemset: list,
@@ -185,10 +170,6 @@ class CandidateGenerator:
             Dictionary containing bindings for stable items.
         flexible_items_binding : dict
             Dictionary containing bindings for flexible items.
-        undesired_mask : Union['numpy.ndarray', 'cupy.ndarray', None]
-            Mask for the undesired state.
-        desired_mask : Union['numpy.ndarray', 'cupy.ndarray', None]
-            Mask for the desired state.
         undesired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
             Packed bit mask for the undesired branch (intersection so far).
         desired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
@@ -238,17 +219,8 @@ class CandidateGenerator:
             undesired_state,
             desired_state,
         )
-
-        use_bitset_masks = (
-            self.bit_masks is not None
-            and bitset_undesired_mask is not None
-            and bitset_desired_mask is not None
-        )
-        if use_bitset_masks:
-            # In bitset mode support is computed from packed masks, so avoid dense frame-mask multiplication.
-            undesired_frame, desired_frame = self.get_frames(None, None, undesired_state, desired_state)
-        else:
-            undesired_frame, desired_frame = self.get_frames(undesired_mask, desired_mask, undesired_state, desired_state)
+        if bitset_undesired_mask is None or bitset_desired_mask is None:
+            return []
 
         stable_candidates = {attribute: list(items) for attribute, items in stable_items_binding.items()}
         flexible_candidates = {attribute: list(items) for attribute, items in flexible_items_binding.items()}
@@ -260,8 +232,6 @@ class CandidateGenerator:
             reduced_stable_items_binding,
             stop_list,
             stable_candidates,
-            undesired_frame,
-            desired_frame,
             new_branches,
             verbose,
             bitset_undesired_mask,
@@ -274,8 +244,6 @@ class CandidateGenerator:
             stop_list,
             stop_list_itemset,
             flexible_candidates,
-            undesired_frame,
-            desired_frame,
             actionable_attributes,
             new_branches,
             verbose,
@@ -301,11 +269,133 @@ class CandidateGenerator:
         """
         if not candidates:
             return []
-        if verbose:
-            return [
-                new_branch
-                for candidate in candidates
-                for new_branch in self.generate_candidates(
+        if not self._can_use_gpu_batching(verbose):
+            return self._generate_candidates_sequential(
+                candidates, stop_list, stop_list_itemset, undesired_state, desired_state, verbose
+            )
+
+        new_branches_all = []
+        batch_contexts = []
+        resolved_batch_size = max(1, int(batch_size))
+
+        for candidate in candidates:
+            context = self._build_batch_context(candidate, undesired_state, desired_state)
+            if context is None:
+                continue
+            batch_contexts.append(context)
+            if len(batch_contexts) >= resolved_batch_size:
+                new_branches_all.extend(
+                    self._flush_batch_contexts(
+                        batch_contexts,
+                        stop_list,
+                        stop_list_itemset,
+                        undesired_state,
+                        desired_state,
+                        verbose,
+                    )
+                )
+                batch_contexts = []
+
+        if batch_contexts:
+            new_branches_all.extend(
+                self._flush_batch_contexts(
+                    batch_contexts,
+                    stop_list,
+                    stop_list_itemset,
+                    undesired_state,
+                    desired_state,
+                    verbose,
+                )
+            )
+
+        return new_branches_all
+
+    def _can_use_gpu_batching(self, verbose: bool) -> bool:
+        """
+        Return True when candidate batching can run on GPU bit masks.
+        """
+        if verbose or self.bit_masks is None:
+            return False
+        return hasattr(self.bit_masks, "__cuda_array_interface__")
+
+    def _build_batch_context(
+        self,
+        candidate: dict,
+        undesired_state: int,
+        desired_state: int,
+    ) -> Optional[dict]:
+        """Prepare one context object used by the GPU batch expansion path."""
+        bitset_undesired_mask, bitset_desired_mask = self._resolve_bitset_masks(
+            candidate.get("itemset_prefix", tuple()),
+            candidate.get("undesired_mask_bitset"),
+            candidate.get("desired_mask_bitset"),
+            candidate.get("parent_undesired_mask_bitset"),
+            candidate.get("parent_desired_mask_bitset"),
+            undesired_state,
+            desired_state,
+        )
+        if bitset_undesired_mask is None or bitset_desired_mask is None:
+            return None
+
+        next_size = len(candidate["itemset_prefix"]) + 1
+        reduced_stable_items_binding, reduced_flexible_items_binding = self.reduce_candidates_by_min_attributes(
+            next_size,
+            candidate["actionable_attributes"],
+            candidate["stable_items_binding"],
+            candidate["flexible_items_binding"],
+        )
+        return {
+            "candidate": candidate,
+            "ar_prefix": candidate["ar_prefix"],
+            "itemset_prefix": candidate["itemset_prefix"],
+            "reduced_stable_items_binding": reduced_stable_items_binding,
+            "reduced_flexible_items_binding": reduced_flexible_items_binding,
+            "stable_candidates": {
+                attribute: list(items) for attribute, items in candidate["stable_items_binding"].items()
+            },
+            "flexible_candidates": {
+                attribute: list(items) for attribute, items in candidate["flexible_items_binding"].items()
+            },
+            "bitset_undesired_mask": bitset_undesired_mask,
+            "bitset_desired_mask": bitset_desired_mask,
+            "actionable_attributes": candidate["actionable_attributes"],
+        }
+
+    def _flush_batch_contexts(
+        self,
+        batch_contexts: list,
+        stop_list: list,
+        stop_list_itemset: list,
+        undesired_state: int,
+        desired_state: int,
+        verbose: bool,
+    ) -> list:
+        """Run one prepared context batch; fallback to sequential mode on failures."""
+        batch_result = self._process_gpu_batch(batch_contexts, stop_list, stop_list_itemset)
+        if batch_result is not None:
+            return batch_result
+        return self._generate_candidates_sequential(
+            [context["candidate"] for context in batch_contexts],
+            stop_list,
+            stop_list_itemset,
+            undesired_state,
+            desired_state,
+            verbose,
+        )
+
+    def _generate_candidates_sequential(
+        self,
+        candidates: list,
+        stop_list: list,
+        stop_list_itemset: list,
+        undesired_state: int,
+        desired_state: int,
+        verbose: bool,
+    ) -> list:
+        new_branches = []
+        for candidate in candidates:
+            new_branches.extend(
+                self.generate_candidates(
                     **candidate,
                     stop_list=stop_list,
                     stop_list_itemset=stop_list_itemset,
@@ -313,305 +403,187 @@ class CandidateGenerator:
                     desired_state=desired_state,
                     verbose=verbose,
                 )
-            ]
+            )
+        return new_branches
+
+    def _process_gpu_batch(
+        self,
+        batch_contexts: list,
+        stop_list: list,
+        stop_list_itemset: list,
+    ) -> Optional[list]:
+        try:
+            import cupy as cp
+        except ImportError:
+            return None
+
+        work_candidate_indices = []
+        work_item_indices = []
+        for ctx_index, context in enumerate(batch_contexts):
+            context["stable_slices"] = []
+            context["flex_slices"] = []
+            for attribute, items in context["reduced_stable_items_binding"].items():
+                active_items = self._active_stable_items(context["ar_prefix"], items, stop_list)
+                if not active_items:
+                    continue
+                start = len(work_item_indices)
+                work_item_indices.extend(active_items)
+                work_candidate_indices.extend([ctx_index] * len(active_items))
+                context["stable_slices"].append((attribute, active_items, start))
+
+            for attribute, items in context["reduced_flexible_items_binding"].items():
+                new_ar_prefix = context["ar_prefix"] + (attribute,)
+                if self.in_stop_list(new_ar_prefix, stop_list):
+                    continue
+                active_items = self._active_flexible_items(context["itemset_prefix"], items, stop_list_itemset)
+                if not active_items:
+                    continue
+                start = len(work_item_indices)
+                work_item_indices.extend(active_items)
+                work_candidate_indices.extend([ctx_index] * len(active_items))
+                context["flex_slices"].append((attribute, active_items, start))
+
+        if not work_item_indices:
+            return []
+
+        try:
+            branch_masks_a = cp.stack(
+                [
+                    cp.asarray(context["bitset_undesired_mask"], dtype=cp.uint64).reshape(-1)
+                    for context in batch_contexts
+                ],
+                axis=0,
+            )
+            branch_masks_b = cp.stack(
+                [
+                    cp.asarray(context["bitset_desired_mask"], dtype=cp.uint64).reshape(-1)
+                    for context in batch_contexts
+                ],
+                axis=0,
+            )
+        except Exception:
+            return None
+
+        supports = self._gpu_bitset_support_batch_multi(
+            branch_masks_a,
+            branch_masks_b,
+            work_candidate_indices,
+            work_item_indices,
+        )
+        if supports is None:
+            return None
 
         new_branches_all = []
-        batch_contexts = []
+        undesired_supports_all, desired_supports_all = supports
+        for context in batch_contexts:
+            new_branches = []
+            stable_candidates = context["stable_candidates"]
+            flexible_candidates = context["flexible_candidates"]
 
-        def flush_batch():
-            nonlocal batch_contexts, new_branches_all
-            if not batch_contexts:
-                return
-
-            def fallback_to_single():
-                nonlocal batch_contexts, new_branches_all
-                for context in batch_contexts:
-                    new_branches_all.extend(
-                        self.generate_candidates(
-                            **context["candidate"],
-                            stop_list=stop_list,
-                            stop_list_itemset=stop_list_itemset,
-                            undesired_state=undesired_state,
-                            desired_state=desired_state,
-                            verbose=verbose,
-                        )
-                    )
-                batch_contexts = []
-
-            try:
-                import cupy as cp
-            except ImportError:
-                fallback_to_single()
-                return
-
-            if not hasattr(self.bit_masks, "__cuda_array_interface__"):
-                fallback_to_single()
-                return
-
-            work_candidate_indices = []
-            work_item_indices = []
-            for ctx_index, context in enumerate(batch_contexts):
-                context["stable_slices"] = []
-                context["flex_slices"] = []
-                for attribute, items in context["reduced_stable_items_binding"].items():
-                    active_items = []
-                    for item in items:
-                        new_ar_prefix = context["ar_prefix"] + (item,)
-                        if self.in_stop_list(new_ar_prefix, stop_list):
-                            continue
-                        active_items.append(item)
-                    if not active_items:
-                        continue
-                    start = len(work_item_indices)
-                    work_item_indices.extend(active_items)
-                    work_candidate_indices.extend([ctx_index] * len(active_items))
-                    context["stable_slices"].append((attribute, active_items, start))
-
-                for attribute, items in context["reduced_flexible_items_binding"].items():
-                    new_ar_prefix = context["ar_prefix"] + (attribute,)
+            for attribute, items, start in context["stable_slices"]:
+                for offset, item in enumerate(items):
+                    new_ar_prefix = context["ar_prefix"] + (item,)
                     if self.in_stop_list(new_ar_prefix, stop_list):
                         continue
-                    active_items = []
-                    for item in items:
-                        if self.in_stop_list(context["itemset_prefix"] + (item,), stop_list_itemset):
-                            continue
-                        active_items.append(item)
-                    if not active_items:
-                        continue
-                    start = len(work_item_indices)
-                    work_item_indices.extend(active_items)
-                    work_candidate_indices.extend([ctx_index] * len(active_items))
-                    context["flex_slices"].append((attribute, active_items, start))
-
-            if not work_item_indices:
-                batch_contexts = []
-                return
-
-            try:
-                branch_masks_a = cp.stack(
-                    [
-                        cp.asarray(context["bitset_undesired_mask"], dtype=cp.uint64).reshape(-1)
-                        for context in batch_contexts
-                    ],
-                    axis=0,
-                )
-                branch_masks_b = cp.stack(
-                    [
-                        cp.asarray(context["bitset_desired_mask"], dtype=cp.uint64).reshape(-1)
-                        for context in batch_contexts
-                    ],
-                    axis=0,
-                )
-            except Exception:
-                fallback_to_single()
-                return
-
-            supports = self._gpu_bitset_support_batch_multi(
-                branch_masks_a,
-                branch_masks_b,
-                work_candidate_indices,
-                work_item_indices,
-            )
-            if supports is None:
-                fallback_to_single()
-                return
-
-            undesired_supports_all, desired_supports_all = supports
-            for context in batch_contexts:
-                new_branches = []
-                stable_candidates = context["stable_candidates"]
-                flexible_candidates = context["flexible_candidates"]
-
-                for attribute, items, start in context["stable_slices"]:
-                    for offset, item in enumerate(items):
-                        new_ar_prefix = context["ar_prefix"] + (item,)
-                        if self.in_stop_list(new_ar_prefix, stop_list):
-                            continue
-                        index = start + offset
-                        undesired_support = undesired_supports_all[index]
-                        desired_support = desired_supports_all[index]
-                        if (
-                            undesired_support < self.min_undesired_support
-                            or desired_support < self.min_desired_support
-                        ):
-                            stable_candidates[attribute].remove(item)
-                            self._add_stop_entry(stop_list, new_ar_prefix)
-                        else:
-                            new_branches.append(
-                                {
-                                    "ar_prefix": new_ar_prefix,
-                                    "itemset_prefix": new_ar_prefix,
-                                    "item": item,
-                                    "undesired_mask": None,
-                                    "desired_mask": None,
-                                    "undesired_mask_bitset": None,
-                                    "desired_mask_bitset": None,
-                                    "parent_undesired_mask_bitset": context["bitset_undesired_mask"],
-                                    "parent_desired_mask_bitset": context["bitset_desired_mask"],
-                                    "actionable_attributes": 0,
-                                }
-                            )
-
-                for attribute, items, start in context["flex_slices"]:
-                    new_ar_prefix = context["ar_prefix"] + (attribute,)
-                    if self.in_stop_list(new_ar_prefix, stop_list):
-                        continue
-                    undesired_states = []
-                    desired_states = []
-                    undesired_count = 0
-                    desired_count = 0
-                    kept_items = []
-                    for offset, item in enumerate(items):
-                        if self.in_stop_list(
-                            context["itemset_prefix"] + (item,), stop_list_itemset
-                        ):
-                            continue
-                        index = start + offset
-                        undesired_support = undesired_supports_all[index]
-                        desired_support = desired_supports_all[index]
-
-                        undesired_conf = self.rules.calculate_confidence(
-                            undesired_support, desired_support
-                        )
-                        if undesired_support >= self.min_undesired_support:
-                            undesired_count += 1
-                            if undesired_conf >= self.min_undesired_confidence:
-                                undesired_states.append(
-                                    {
-                                        "item": item,
-                                        "support": undesired_support,
-                                        "confidence": undesired_conf,
-                                    }
-                                )
-                            else:
-                                self.rules.add_prefix_without_conf(new_ar_prefix, False)
-
-                        desired_conf = self.rules.calculate_confidence(
-                            desired_support, undesired_support
-                        )
-                        if desired_support >= self.min_desired_support:
-                            desired_count += 1
-                            if desired_conf >= self.min_desired_confidence:
-                                desired_states.append(
-                                    {
-                                        "item": item,
-                                        "support": desired_support,
-                                        "confidence": desired_conf,
-                                    }
-                                )
-                            else:
-                                self.rules.add_prefix_without_conf(new_ar_prefix, True)
-
-                        if (
-                            desired_support < self.min_desired_support
-                            and undesired_support < self.min_undesired_support
-                        ):
-                            flexible_candidates[attribute].remove(item)
-                            self._add_stop_entry(
-                                stop_list_itemset, context["itemset_prefix"] + (item,)
-                            )
-                            continue
-
-                        kept_items.append(item)
-
-                    if context["actionable_attributes"] == 0 and (
-                        undesired_count == 0 or desired_count == 0
-                    ):
-                        del flexible_candidates[attribute]
-                        self._add_stop_entry(stop_list, context["ar_prefix"] + (attribute,))
+                    index = start + offset
+                    undesired_support = undesired_supports_all[index]
+                    desired_support = desired_supports_all[index]
+                    if undesired_support < self.min_undesired_support or desired_support < self.min_desired_support:
+                        stable_candidates[attribute].remove(item)
+                        self._add_stop_entry(stop_list, new_ar_prefix)
                     else:
-                        for item in kept_items:
-                            new_branches.append(
+                        new_branches.append(
+                            {
+                                "ar_prefix": new_ar_prefix,
+                                "itemset_prefix": new_ar_prefix,
+                                "item": item,
+                                "undesired_mask_bitset": None,
+                                "desired_mask_bitset": None,
+                                "parent_undesired_mask_bitset": context["bitset_undesired_mask"],
+                                "parent_desired_mask_bitset": context["bitset_desired_mask"],
+                                "actionable_attributes": 0,
+                            }
+                        )
+
+            for attribute, items, start in context["flex_slices"]:
+                new_ar_prefix = context["ar_prefix"] + (attribute,)
+                if self.in_stop_list(new_ar_prefix, stop_list):
+                    continue
+                undesired_states = []
+                desired_states = []
+                undesired_count = 0
+                desired_count = 0
+                kept_items = []
+                for offset, item in enumerate(items):
+                    if self.in_stop_list(context["itemset_prefix"] + (item,), stop_list_itemset):
+                        continue
+                    index = start + offset
+                    undesired_support = undesired_supports_all[index]
+                    desired_support = desired_supports_all[index]
+
+                    undesired_conf = self.rules.calculate_confidence(undesired_support, desired_support)
+                    if undesired_support >= self.min_undesired_support:
+                        undesired_count += 1
+                        if undesired_conf >= self.min_undesired_confidence:
+                            undesired_states.append(
                                 {
-                                    "ar_prefix": new_ar_prefix,
-                                    "itemset_prefix": context["itemset_prefix"] + (item,),
                                     "item": item,
-                                    "undesired_mask": None,
-                                    "desired_mask": None,
-                                    "undesired_mask_bitset": None,
-                                    "desired_mask_bitset": None,
-                                    "parent_undesired_mask_bitset": context["bitset_undesired_mask"],
-                                    "parent_desired_mask_bitset": context["bitset_desired_mask"],
-                                    "actionable_attributes": context["actionable_attributes"] + 1,
+                                    "support": undesired_support,
+                                    "confidence": undesired_conf,
                                 }
                             )
-                        if context["actionable_attributes"] + 1 >= self.min_flexible_attributes:
-                            self.rules.add_classification_rules(
-                                new_ar_prefix,
-                                context["itemset_prefix"],
-                                undesired_states,
-                                desired_states,
+                        else:
+                            self.rules.add_prefix_without_conf(new_ar_prefix, False)
+
+                    desired_conf = self.rules.calculate_confidence(desired_support, undesired_support)
+                    if desired_support >= self.min_desired_support:
+                        desired_count += 1
+                        if desired_conf >= self.min_desired_confidence:
+                            desired_states.append(
+                                {
+                                    "item": item,
+                                    "support": desired_support,
+                                    "confidence": desired_conf,
+                                }
                             )
+                        else:
+                            self.rules.add_prefix_without_conf(new_ar_prefix, True)
 
-                self.update_new_branches(new_branches, stable_candidates, flexible_candidates)
-                new_branches_all.extend(new_branches)
+                    if desired_support < self.min_desired_support and undesired_support < self.min_undesired_support:
+                        flexible_candidates[attribute].remove(item)
+                        self._add_stop_entry(stop_list_itemset, context["itemset_prefix"] + (item,))
+                        continue
 
-            batch_contexts = []
+                    kept_items.append(item)
 
-        for candidate in candidates:
-            bitset_undesired_mask, bitset_desired_mask = self._resolve_bitset_masks(
-                candidate.get("itemset_prefix", tuple()),
-                candidate.get("undesired_mask_bitset"),
-                candidate.get("desired_mask_bitset"),
-                candidate.get("parent_undesired_mask_bitset"),
-                candidate.get("parent_desired_mask_bitset"),
-                undesired_state,
-                desired_state,
-            )
-            use_bitset_masks = (
-                self.bit_masks is not None
-                and bitset_undesired_mask is not None
-                and bitset_desired_mask is not None
-            )
-            if not use_bitset_masks:
-                flush_batch()
-                new_branches_all.extend(
-                    self.generate_candidates(
-                        **candidate,
-                        stop_list=stop_list,
-                        stop_list_itemset=stop_list_itemset,
-                        undesired_state=undesired_state,
-                        desired_state=desired_state,
-                        verbose=verbose,
-                    )
-                )
-                continue
+                if context["actionable_attributes"] == 0 and (undesired_count == 0 or desired_count == 0):
+                    del flexible_candidates[attribute]
+                    self._add_stop_entry(stop_list, context["ar_prefix"] + (attribute,))
+                else:
+                    for item in kept_items:
+                        new_branches.append(
+                            {
+                                "ar_prefix": new_ar_prefix,
+                                "itemset_prefix": context["itemset_prefix"] + (item,),
+                                "item": item,
+                                "undesired_mask_bitset": None,
+                                "desired_mask_bitset": None,
+                                "parent_undesired_mask_bitset": context["bitset_undesired_mask"],
+                                "parent_desired_mask_bitset": context["bitset_desired_mask"],
+                                "actionable_attributes": context["actionable_attributes"] + 1,
+                            }
+                        )
+                    if context["actionable_attributes"] + 1 >= self.min_flexible_attributes:
+                        self.rules.add_classification_rules(
+                            new_ar_prefix,
+                            context["itemset_prefix"],
+                            undesired_states,
+                            desired_states,
+                        )
 
-            k = len(candidate["itemset_prefix"]) + 1
-            reduced_stable_items_binding, reduced_flexible_items_binding = (
-                self.reduce_candidates_by_min_attributes(
-                    k,
-                    candidate["actionable_attributes"],
-                    candidate["stable_items_binding"],
-                    candidate["flexible_items_binding"],
-                )
-            )
-            stable_candidates = {
-                attribute: list(items)
-                for attribute, items in candidate["stable_items_binding"].items()
-            }
-            flexible_candidates = {
-                attribute: list(items)
-                for attribute, items in candidate["flexible_items_binding"].items()
-            }
-            batch_contexts.append(
-                {
-                    "candidate": candidate,
-                    "ar_prefix": candidate["ar_prefix"],
-                    "itemset_prefix": candidate["itemset_prefix"],
-                    "reduced_stable_items_binding": reduced_stable_items_binding,
-                    "reduced_flexible_items_binding": reduced_flexible_items_binding,
-                    "stable_candidates": stable_candidates,
-                    "flexible_candidates": flexible_candidates,
-                    "bitset_undesired_mask": bitset_undesired_mask,
-                    "bitset_desired_mask": bitset_desired_mask,
-                    "actionable_attributes": candidate["actionable_attributes"],
-                }
-            )
-            if batch_size > 0 and len(batch_contexts) >= batch_size:
-                flush_batch()
+            self.update_new_branches(new_branches, stable_candidates, flexible_candidates)
+            new_branches_all.extend(new_branches)
 
-        flush_batch()
         return new_branches_all
 
     @staticmethod
@@ -623,6 +595,24 @@ class CandidateGenerator:
             stop_collection.add(value)
         else:
             stop_collection.append(value)
+
+    def _active_stable_items(self, ar_prefix: tuple, items: list, stop_list: list) -> list:
+        """Return stable items not blocked by `stop_list`."""
+        active_items = []
+        for item in items:
+            if self.in_stop_list(ar_prefix + (item,), stop_list):
+                continue
+            active_items.append(item)
+        return active_items
+
+    def _active_flexible_items(self, itemset_prefix: tuple, items: list, stop_list_itemset: list) -> list:
+        """Return flexible items not blocked by `stop_list_itemset`."""
+        active_items = []
+        for item in items:
+            if self.in_stop_list(itemset_prefix + (item,), stop_list_itemset):
+                continue
+            active_items.append(item)
+        return active_items
 
     def _resolve_bitset_masks(
         self,
@@ -653,62 +643,6 @@ class CandidateGenerator:
         if bitset_desired_mask is None:
             bitset_desired_mask = base_desired
         return bitset_undesired_mask, bitset_desired_mask
-
-    def get_frames(
-        self,
-        undesired_mask: Union[
-            'numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix', 'scipy.sparse.csr_matrix', None
-        ],
-        desired_mask: Union[
-            'numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix', 'scipy.sparse.csr_matrix', None
-        ],
-        undesired_state: int,
-        desired_state: int,
-    ) -> tuple:
-        """
-        Get the frames for the undesired and desired states.
-
-        Parameters
-        ----------
-        undesired_mask : Union['numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix',
-                               'scipy.sparse.csr_matrix', None]
-            Mask for the undesired state.
-        desired_mask : Union['numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix',
-                            'scipy.sparse.csr_matrix', None]
-            Mask for the desired state.
-        undesired_state : int
-            The undesired state of the target attribute.
-        desired_state : int
-            The desired state of the target attribute.
-
-        Returns
-        -------
-        tuple
-            Tuple containing the frames for the undesired and desired states.
-
-        Notes
-        -----
-        This method retrieves the frames for the undesired and desired states using the provided masks.
-        If no masks are provided, the method returns the frames as they are stored. If masks are provided,
-        the method applies them to the frames, performing element-wise multiplication to filter the data.
-        """
-        if undesired_mask is None:
-            return self.frames[undesired_state], self.frames[desired_state]
-        else:
-            if self.use_sparse_matrix:
-                if undesired_mask.getnnz() > 0:  # type: ignore
-                    undesired_frame = self.frames[undesired_state].multiply(undesired_mask)
-                else:
-                    undesired_frame = self.frames[undesired_state] * 0
-                if desired_mask.getnnz() > 0:  # type: ignore
-                    desired_frame = self.frames[desired_state].multiply(desired_mask)
-                else:
-                    desired_frame = self.frames[desired_state] * 0
-            else:
-                undesired_frame = self.frames[undesired_state] * undesired_mask
-                desired_frame = self.frames[desired_state] * desired_mask
-            del undesired_mask, desired_mask
-            return undesired_frame, desired_frame
 
     def reduce_candidates_by_min_attributes(
         self, k: int, actionable_attributes: int, stable_items_binding: dict, flexible_items_binding: dict
@@ -772,12 +706,6 @@ class CandidateGenerator:
         reduced_stable_items_binding: dict,
         stop_list: list,
         stable_candidates: dict,
-        undesired_frame: Union[
-            'numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix', 'scipy.sparse.csr_matrix'
-        ],
-        desired_frame: Union[
-            'numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix', 'scipy.sparse.csr_matrix'
-        ],
         new_branches: list,
         verbose: bool,
         undesired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
@@ -798,12 +726,6 @@ class CandidateGenerator:
             List of stop combinations.
         stable_candidates : dict
             Dictionary containing stable candidates.
-        undesired_frame : Union['numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix',
-                                'scipy.sparse.csr_matrix']
-            Data frame for the undesired state.
-        desired_frame : Union['numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix',
-                              'scipy.sparse.csr_matrix']
-            Data frame for the desired state.
         undesired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
             Packed mask representing the current undesired branch.
         desired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
@@ -812,10 +734,6 @@ class CandidateGenerator:
             List of new branches generated.
         verbose : bool
             If True, enables verbose output.
-        undesired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
-            Packed mask representing the current undesired branch.
-        desired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
-            Packed mask representing the current desired branch.
 
         Notes
         -----
@@ -824,39 +742,18 @@ class CandidateGenerator:
         If the support values meet the minimum thresholds, new branches are created and added to the
         new branches list.
         """
-        use_bitset_masks = (
-            self.bit_masks is not None
-            and undesired_mask_bitset is not None
-            and desired_mask_bitset is not None
-        )
+        if undesired_mask_bitset is None or desired_mask_bitset is None:
+            return
         for attribute, items in reduced_stable_items_binding.items():
-            if use_bitset_masks:
-                active_items = []
-                for item in items:
-                    new_ar_prefix = ar_prefix + (item,)
-                    if self.in_stop_list(new_ar_prefix, stop_list):
-                        continue
-                    active_items.append(item)
-                if not active_items:
-                    continue
-                undesired_supports = self._bitset_support_batch(undesired_mask_bitset, active_items)  # type: ignore[arg-type]
-                desired_supports = self._bitset_support_batch(desired_mask_bitset, active_items)  # type: ignore[arg-type]
-                item_iter = zip(active_items, undesired_supports, desired_supports)
-            else:
-                item_iter = ((item, None, None) for item in items)
+            active_items = self._active_stable_items(ar_prefix, items, stop_list)
+            if not active_items:
+                continue
+            undesired_supports = self._bitset_support_batch(undesired_mask_bitset, active_items)
+            desired_supports = self._bitset_support_batch(desired_mask_bitset, active_items)
+            item_iter = zip(active_items, undesired_supports, desired_supports)
 
             for item, undesired_support, desired_support in item_iter:
                 new_ar_prefix = ar_prefix + (item,)
-                if not use_bitset_masks and self.in_stop_list(new_ar_prefix, stop_list):
-                    continue
-
-                if not use_bitset_masks:
-                    undesired_support = self.get_support(
-                        undesired_frame, item, mask_bitset=undesired_mask_bitset
-                    )
-                    desired_support = self.get_support(
-                        desired_frame, item, mask_bitset=desired_mask_bitset
-                    )
 
                 if verbose:
                     print('SUPPORT for: ' + str(itemset_prefix + (item,)))
@@ -875,58 +772,35 @@ class CandidateGenerator:
                             'ar_prefix': new_ar_prefix,
                             'itemset_prefix': new_ar_prefix,
                             'item': item,
-                            'undesired_mask': None if use_bitset_masks else undesired_frame[item],
-                            'desired_mask': None if use_bitset_masks else desired_frame[item],
-                            'undesired_mask_bitset': None
-                            if use_bitset_masks
-                            else self._intersect_bit_mask(undesired_mask_bitset, item),
-                            'desired_mask_bitset': None
-                            if use_bitset_masks
-                            else self._intersect_bit_mask(desired_mask_bitset, item),
-                            'parent_undesired_mask_bitset': undesired_mask_bitset if use_bitset_masks else None,
-                            'parent_desired_mask_bitset': desired_mask_bitset if use_bitset_masks else None,
+                            'undesired_mask_bitset': None,
+                            'desired_mask_bitset': None,
+                            'parent_undesired_mask_bitset': undesired_mask_bitset,
+                            'parent_desired_mask_bitset': desired_mask_bitset,
                             'actionable_attributes': 0,
                         }
                     )
 
     def get_support(
         self,
-        frame: Union['numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix', 'scipy.sparse.csr_matrix'],
+        mask_bitset: Union['numpy.ndarray', 'cupy.ndarray'],
         item: int,
-        mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
     ) -> int:
         """
-        Calculate the sum of elements in a specified row of the given frame.
-
-        This function takes a 2D array (`frame`) and an integer (`item`) representing
-        the index of a row. It returns the sum of all elements in that row.
+        Calculate support for one item under the provided packed branch mask.
 
         Parameters
         ----------
-        frame : Union[numpy.ndarray, cupy.ndarray, 'cupyx.scipy.sparse.csr_matrix', 'scipy.sparse.csr_matrix']
-            A 2D array from which the row is selected. The array can be a NumPy or CuPy array.
+        mask_bitset : Union[numpy.ndarray, cupy.ndarray]
+            Packed branch mask representing currently surviving transactions.
         item : int
-            The index of the row to be summed.
+            Item row index in `self.bit_masks`.
 
         Returns
         -------
         int
-            The sum of all elements in the specified row of the frame.
-
-        Notes
-        -----
-        - This function is compatible with both NumPy and CuPy arrays.
-        - Ensure that the `item` index is within the bounds of the frame's rows.
-        - For sparse matrices, the sum is computed efficiently by leveraging sparse matrix operations.
+            Support count for the given item.
         """
-        if mask_bitset is not None and self.bit_masks is not None:
-            return self._bitset_support(mask_bitset, item)
-        row = frame[item]
-        if hasattr(row, "sum"):
-            return int(row.sum())
-        import numpy as np
-
-        return int(np.sum(row))
+        return self._bitset_support(mask_bitset, item)
 
     def _bitset_support(
         self, mask_bitset: Union['numpy.ndarray', 'cupy.ndarray'], item: int
@@ -1462,12 +1336,6 @@ class CandidateGenerator:
         stop_list: list,
         stop_list_itemset: list,
         flexible_candidates: dict,
-        undesired_frame: Union[
-            'numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix', 'scipy.sparse.csr_matrix'
-        ],
-        desired_frame: Union[
-            'numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix', 'scipy.sparse.csr_matrix'
-        ],
         actionable_attributes: int,
         new_branches: list,
         verbose: bool,
@@ -1491,22 +1359,16 @@ class CandidateGenerator:
             List of stop itemsets.
         flexible_candidates : dict
             Dictionary containing flexible candidates.
-        undesired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
-            Packed mask representing the current undesired branch.
-        desired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
-            Packed mask representing the current desired branch.
-        undesired_frame : Union['numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix',
-                                'scipy.sparse.csr_matrix']
-            Data frame for the undesired state.
-        desired_frame : Union['numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix',
-                              'scipy.sparse.csr_matrix']
-            Data frame for the desired state.
         actionable_attributes : int
             Number of actionable attributes.
         new_branches : list
             List of new branches generated.
         verbose : bool
             If True, enables verbose output.
+        undesired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
+            Packed mask representing the current undesired branch.
+        desired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
+            Packed mask representing the current desired branch.
 
         Notes
         -----
@@ -1516,11 +1378,8 @@ class CandidateGenerator:
         new branches list. The method also updates the rules with new classification rules if the
         number of actionable attributes meets the minimum required.
         """
-        use_bitset_masks = (
-            self.bit_masks is not None
-            and undesired_mask_bitset is not None
-            and desired_mask_bitset is not None
-        )
+        if undesired_mask_bitset is None or desired_mask_bitset is None:
+            return
         for attribute, items in reduced_flexible_items_binding.items():
             new_ar_prefix = ar_prefix + (attribute,)
             if self.in_stop_list(new_ar_prefix, stop_list):
@@ -1538,8 +1397,6 @@ class CandidateGenerator:
                 itemset_prefix,
                 new_ar_prefix,
                 stop_list_itemset,
-                undesired_frame,
-                desired_frame,
                 flexible_candidates,
                 verbose,
                 undesired_mask_bitset=undesired_mask_bitset,
@@ -1551,22 +1408,15 @@ class CandidateGenerator:
                 self._add_stop_entry(stop_list, ar_prefix + (attribute,))
             else:
                 for item in kept_items:
-                    next_undesired_bitset = None
-                    next_desired_bitset = None
-                    if not use_bitset_masks:
-                        next_undesired_bitset = self._intersect_bit_mask(undesired_mask_bitset, item)
-                        next_desired_bitset = self._intersect_bit_mask(desired_mask_bitset, item)
                     new_branches.append(
                         {
                             'ar_prefix': new_ar_prefix,
                             'itemset_prefix': itemset_prefix + (item,),
                             'item': item,
-                            'undesired_mask': None if use_bitset_masks else undesired_frame[item],
-                            'desired_mask': None if use_bitset_masks else desired_frame[item],
-                            'undesired_mask_bitset': None if use_bitset_masks else next_undesired_bitset,
-                            'desired_mask_bitset': None if use_bitset_masks else next_desired_bitset,
-                            'parent_undesired_mask_bitset': undesired_mask_bitset if use_bitset_masks else None,
-                            'parent_desired_mask_bitset': desired_mask_bitset if use_bitset_masks else None,
+                            'undesired_mask_bitset': None,
+                            'desired_mask_bitset': None,
+                            'parent_undesired_mask_bitset': undesired_mask_bitset,
+                            'parent_desired_mask_bitset': desired_mask_bitset,
                             'actionable_attributes': actionable_attributes + 1,
                         }
                     )
@@ -1585,12 +1435,6 @@ class CandidateGenerator:
         itemset_prefix: tuple,
         new_ar_prefix: tuple,
         stop_list_itemset: list,
-        undesired_frame: Union[
-            'numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix', 'scipy.sparse.csr_matrix'
-        ],
-        desired_frame: Union[
-            'numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix', 'scipy.sparse.csr_matrix'
-        ],
         flexible_candidates: dict,
         verbose: bool,
         undesired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
@@ -1611,20 +1455,14 @@ class CandidateGenerator:
             Prefix for stop list.
         stop_list_itemset : list
             List of stop itemsets.
-        undesired_frame : Union['numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix',
-                                'scipy.sparse.csr_matrix']
-            Data frame for the undesired state.
-        desired_frame : Union['numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix',
-                              'scipy.sparse.csr_matrix']
-            Data frame for the desired state.
-        undesired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
-            Packed mask representing the current undesired branch.
-        desired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
-            Packed mask representing the current desired branch.
         flexible_candidates : dict
             Dictionary containing flexible candidates.
         verbose : bool
             If True, enables verbose output.
+        undesired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
+            Packed mask representing the current undesired branch.
+        desired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
+            Packed mask representing the current desired branch.
 
         Returns
         -------
@@ -1644,38 +1482,17 @@ class CandidateGenerator:
         undesired_count = 0
         desired_count = 0
         kept_items = []
-        use_bitset_masks = (
-            self.bit_masks is not None
-            and undesired_mask_bitset is not None
-            and desired_mask_bitset is not None
-        )
-        if use_bitset_masks:
-            active_items = []
-            for item in items:
-                if self.in_stop_list(itemset_prefix + (item,), stop_list_itemset):
-                    continue
-                active_items.append(item)
-            if not active_items:
-                item_iter = ()
-            else:
-                undesired_supports = self._bitset_support_batch(undesired_mask_bitset, active_items)  # type: ignore[arg-type]
-                desired_supports = self._bitset_support_batch(desired_mask_bitset, active_items)  # type: ignore[arg-type]
-                item_iter = zip(active_items, undesired_supports, desired_supports)
+        if undesired_mask_bitset is None or desired_mask_bitset is None:
+            return undesired_states, desired_states, undesired_count, desired_count, kept_items
+        active_items = self._active_flexible_items(itemset_prefix, items, stop_list_itemset)
+        if not active_items:
+            item_iter = ()
         else:
-            item_iter = ((item, None, None) for item in items)
+            undesired_supports = self._bitset_support_batch(undesired_mask_bitset, active_items)
+            desired_supports = self._bitset_support_batch(desired_mask_bitset, active_items)
+            item_iter = zip(active_items, undesired_supports, desired_supports)
 
         for item, undesired_support, desired_support in item_iter:
-            if not use_bitset_masks and self.in_stop_list(itemset_prefix + (item,), stop_list_itemset):
-                continue
-
-            if not use_bitset_masks:
-                undesired_support = self.get_support(
-                    undesired_frame, item, mask_bitset=undesired_mask_bitset
-                )
-                desired_support = self.get_support(
-                    desired_frame, item, mask_bitset=desired_mask_bitset
-                )
-
             if verbose:
                 print('SUPPORT for: ' + str(itemset_prefix + (item,)))
                 print('_________________________________________________')

@@ -14,15 +14,13 @@ if TYPE_CHECKING:
 
     import cudf
     import cupy
-    import cupyx
     import numpy
     import pandas
-    import scipy
 
 
 class ActionRules:
     """
-    A class used to generate action rules for a given dataset.
+    Generate action rules from tabular data using one-hot encoding and bitset support counting.
 
     Attributes
     ----------
@@ -63,15 +61,12 @@ class ActionRules:
 
     Methods
     -------
-    fit(data, stable_attributes, flexible_attributes, target, undesired_state, desired_state, use_sparse_matrix=False,
-    use_gpu=False)
+    fit(data, stable_attributes, flexible_attributes, target, undesired_state, desired_state, use_gpu=False)
         Generates action rules based on the provided dataset and parameters.
     get_bindings(data, stable_attributes, flexible_attributes, target)
         Binds attributes to corresponding columns in the dataset.
     get_stop_list(stable_items_binding, flexible_items_binding)
         Generates a stop list to prevent certain combinations of attributes.
-    get_split_tables(data, target_items_binding, target)
-        Splits the dataset into tables based on target item bindings.
     get_rules()
         Returns the generated action rules if available.
     predict(frame_row)
@@ -248,16 +243,14 @@ class ActionRules:
         self.is_gpu_np = is_gpu_np
         self.is_gpu_pd = is_gpu_pd
 
-    def df_to_array(self, df: Union['cudf.DataFrame', 'pandas.DataFrame'], use_sparse_matrix: bool = False) -> tuple:
+    def df_to_array(self, df: Union['cudf.DataFrame', 'pandas.DataFrame']) -> tuple:
         """
-        Convert a DataFrame to a numpy or CuPy array.
+        Convert a one-hot DataFrame to a transposed binary array.
 
         Parameters
         ----------
         df : Union[cudf.DataFrame, pandas.DataFrame]
             The DataFrame to convert.
-        use_sparse_matrix : bool, optional
-            If True, a sparse matrix is used. Default is False.
 
         Returns
         -------
@@ -266,44 +259,16 @@ class ActionRules:
 
         Notes
         -----
-        The data is converted to an unsigned 8-bit integer array (`np.uint8`). If `use_gpu` is True,
-        the array is further converted to a CuPy array.
+        The data is converted to an unsigned 8-bit array (`np.uint8`), backed by
+        NumPy or CuPy depending on the selected execution backend.
         """
         columns = list(df.columns)
-        # cuDF and CuPy
-        if self.is_gpu_np and self.is_gpu_pd:
-            if use_sparse_matrix:
-                from cupyx.scipy.sparse import csr_matrix
-
-                data = csr_matrix(df.values, dtype=self.np.float32).T  # type: ignore
-            else:
-                data = self.np.asarray(df.values, dtype=self.np.uint8).T  # type: ignore
-        # Pandas and CuPy
-        elif self.is_gpu_np and not self.is_gpu_pd:
-            if use_sparse_matrix:
-                from cupyx.scipy.sparse import csr_matrix
-                from scipy.sparse import csr_matrix as scipy_csr_matrix
-
-                scipy_matrix = scipy_csr_matrix(df.values).T
-                data = csr_matrix(scipy_matrix, dtype=float)
-            else:
-                data = self.np.asarray(df.values, dtype=self.np.uint8).T  # type: ignore
-        # cuDF and Numpy
-        elif not self.is_gpu_np and self.is_gpu_pd:
-            if use_sparse_matrix:
-                from scipy.sparse import csr_matrix
-
-                data = csr_matrix(df.to_numpy(), dtype=self.np.uint8).T  # type: ignore
-            else:
-                data = df.to_numpy().T  # type: ignore
-        # Pandas and Numpy
+        if self.is_gpu_np:
+            data = self.np.asarray(df.values, dtype=self.np.uint8).T  # type: ignore
+        elif self.is_gpu_pd:
+            data = df.to_numpy().T  # type: ignore
         else:
-            if use_sparse_matrix:
-                from scipy.sparse import csr_matrix
-
-                data = csr_matrix(df.values, dtype=self.np.uint8).T  # type: ignore
-            else:
-                data = df.to_numpy(dtype=self.np.uint8).T  # type: ignore
+            data = df.to_numpy(dtype=self.np.uint8).T  # type: ignore
         return data, columns
 
     def build_bit_masks(
@@ -435,19 +400,16 @@ class ActionRules:
         target: dict,
         target_undesired_state: str,
         target_desired_state: str,
-        use_sparse_matrix: bool = False,
         use_gpu: bool = False,
-        use_bitset: bool = False,
         max_gpu_mem_mb: Optional[int] = None,
         gpu_batch_size: Optional[int] = None,
     ):
         """
-        Preprocess and fit the model using one-hot encoded attributes.
+        Fit the model when input data is already one-hot encoded.
 
-        This method prepares the dataset for generating action rules by
-        performing one-hot encoding on the specified stable, flexible,
-        and target attributes. The resulting dataset is then used to fit
-        the model using the `fit` method.
+        The method remaps one-hot columns to the internal naming convention
+        (`_<item_stable>_`, `_<item_flexible>_`, `_<item_target>_`), drops
+        unrelated columns, and forwards execution to `fit`.
 
         Parameters
         ----------
@@ -466,14 +428,9 @@ class ActionRules:
             The undesired state of the target attribute, used in action rule generation.
         target_desired_state : str
             The desired state of the target attribute, used in action rule generation.
-        use_sparse_matrix : bool, optional
-            If True, a sparse matrix is used in the fitting process. Default is False.
         use_gpu : bool, optional
             If True, the GPU (cuDF) is used for data processing if available.
             Default is False.
-        use_bitset : bool, optional
-            If True and not using sparse matrices, build packed bit masks and
-            use the bitset support-counting path. Default is False.
         max_gpu_mem_mb : int, optional
             Optional GPU memory cap (in MB) for CuPy allocations and bitset
             support batching. If None, automatic memory-based chunking is used.
@@ -483,14 +440,7 @@ class ActionRules:
 
         Notes
         -----
-        The method modifies the dataset by:
-        1. Renaming columns according to the stable, flexible, and target attributes.
-        2. Removing columns that are not associated with any of these attributes.
-        3. Passing the processed dataset and relevant attribute lists to the `fit` method
-           to generate action rules.
-
-        This method ensures that the dataset is correctly preprocessed for rule
-        generation, focusing on the specified attributes and their one-hot encoded forms.
+        This method expects boolean/binary one-hot columns.
         """
         self.is_onehot = True
         data = data.copy()
@@ -529,9 +479,7 @@ class ActionRules:
             attribute_target,
             target_undesired_state,
             target_desired_state,
-            use_sparse_matrix,
             use_gpu,
-            use_bitset,
             max_gpu_mem_mb,
             gpu_batch_size,
         )
@@ -544,14 +492,12 @@ class ActionRules:
         target: str,
         target_undesired_state: str,
         target_desired_state: str,
-        use_sparse_matrix: bool = False,
         use_gpu: bool = False,
-        use_bitset: bool = False,
         max_gpu_mem_mb: Optional[int] = None,
         gpu_batch_size: Optional[int] = None,
     ):
         """
-        Generate action rules based on the provided dataset and parameters.
+        Generate action rules for the provided dataset.
 
         Parameters
         ----------
@@ -567,13 +513,8 @@ class ActionRules:
             The undesired state of the target attribute.
         target_desired_state : str
             The desired state of the target attribute.
-        use_sparse_matrix : bool, optional
-            If True, a sparse matrix is used. Default is False.
         use_gpu : bool, optional
             Use GPU (cuDF) for data processing if available. Default is False.
-        use_bitset : bool, optional
-            If True and not using sparse matrices, build packed bit masks and
-            use the bitset support-counting path. Default is False.
         max_gpu_mem_mb : int, optional
             Optional GPU memory cap (in MB) for CuPy allocations and bitset
             support batching. If None, automatic memory-based chunking is used.
@@ -588,8 +529,9 @@ class ActionRules:
 
         Notes
         -----
-        This method performs one-hot encoding on the specified attributes, converts the DataFrame to an array,
-        and generates action rules by iterating over candidate rules and pruning them based on the given parameters.
+        The method runs one-hot encoding (when needed), packs bit masks, explores
+        candidate branches, prunes classification rules by depth, and finally
+        materializes action rules.
         """
         if self.output is not None:
             raise RuntimeError("The model is already fit.")
@@ -598,9 +540,6 @@ class ActionRules:
         self.bit_masks = None
         self.target_state_bit_masks = None
         self.frames_bit_masks = None
-        if max_gpu_mem_mb is not None and max_gpu_mem_mb <= 0:
-            raise ValueError("max_gpu_mem_mb must be a positive integer when provided.")
-
         self.set_array_library(use_gpu, data)
         previous_gpu_pool_limit = None
         if self.is_gpu_np and max_gpu_mem_mb is not None:
@@ -613,9 +552,7 @@ class ActionRules:
                 previous_gpu_pool_limit = None
         if not self.is_onehot:
             data = self.one_hot_encode(data, stable_attributes, flexible_attributes, target)
-        data, columns = self.df_to_array(data, use_sparse_matrix)
-
-        
+        data, columns = self.df_to_array(data)
 
         stable_items_binding, flexible_items_binding, target_items_binding, column_values = self.get_bindings(
             columns, stable_attributes, flexible_attributes, target
@@ -623,27 +560,19 @@ class ActionRules:
 
         self.intrinsic_utility_table, self.transition_utility_table = self.remap_utility_tables(column_values)
 
-        if not use_sparse_matrix and use_bitset:
-            local_bit_masks = self.build_bit_masks(data)
-            self._cache_bitset_structures(local_bit_masks, target_items_binding, target)
-            self.frames_bit_masks = self.get_split_bit_masks(target_items_binding, target)
+        local_bit_masks = self.build_bit_masks(data)
+        self._cache_bitset_structures(local_bit_masks, target_items_binding, target)
+        self.frames_bit_masks = self.get_split_bit_masks(target_items_binding, target)
 
         if self.verbose:
             print('Maximum number of nodes to check for support:')
             print('_____________________________________________')
             print(self.count_max_nodes(stable_items_binding, flexible_items_binding))
             print('')
-        use_bitset_masks = bool(
-            not use_sparse_matrix and use_bitset and self.bit_masks is not None and self.frames_bit_masks
-        )
+        use_gpu_batching = bool(self.is_gpu_np and self.bit_masks is not None and self.frames_bit_masks)
 
         # Set membership is hot in candidate pruning; use a set internally for O(1) lookups.
         stop_list = set(self.get_stop_list(stable_items_binding, flexible_items_binding))
-        if use_bitset_masks:
-            # Bitset mode computes support from packed masks, so dense target-frame slices are unnecessary.
-            frames = {item: None for item in target_items_binding[target]}
-        else:
-            frames = self.get_split_tables(data, target_items_binding, target, use_sparse_matrix)
         undesired_state = columns.index(target + '_<item_target>_' + str(target_undesired_state))
         desired_state = columns.index(target + '_<item_target>_' + str(target_desired_state))
 
@@ -655,8 +584,6 @@ class ActionRules:
                 'itemset_prefix': tuple(),
                 'stable_items_binding': stable_items_binding,
                 'flexible_items_binding': flexible_items_binding,
-                'undesired_mask': None,
-                'desired_mask': None,
                 'undesired_mask_bitset': None,
                 'desired_mask_bitset': None,
                 'actionable_attributes': 0,
@@ -675,9 +602,8 @@ class ActionRules:
             self.transition_utility_table,
         )
         candidate_generator = CandidateGenerator(
-            frames=frames,
-            frames_bit_masks=self.frames_bit_masks if use_bitset_masks else None,
-            bit_masks=self.bit_masks if use_bitset_masks else None,
+            frames_bit_masks=self.frames_bit_masks,
+            bit_masks=self.bit_masks,
             min_stable_attributes=self.min_stable_attributes,
             min_flexible_attributes=self.min_flexible_attributes,
             min_undesired_support=self.min_undesired_support,
@@ -687,25 +613,30 @@ class ActionRules:
             undesired_state=undesired_state,
             desired_state=desired_state,
             rules=self.rules,
-            use_sparse_matrix=use_sparse_matrix,
             gpu_batch_budget_mb=max_gpu_mem_mb,
-            spill_gpu_masks_to_cpu=bool(
-                self.is_gpu_np and (not use_sparse_matrix and use_bitset) and max_gpu_mem_mb is not None
-            ),
+            spill_gpu_masks_to_cpu=bool(self.is_gpu_np and max_gpu_mem_mb is not None),
         )
         effective_gpu_batch_size = gpu_batch_size if gpu_batch_size is not None else 32
+
+        def pop_next_candidate() -> dict:
+            """
+            Pop one pending candidate and keep pending-depth bookkeeping in sync.
+            """
+            nonlocal min_pending_depth
+            candidate_to_expand = candidates_stack.pop()
+            depth = len(candidate_to_expand['ar_prefix'])
+            pending_depth_counts[depth] -= 1
+            if pending_depth_counts[depth] <= 0:
+                pending_depth_counts.pop(depth, None)
+                if depth == min_pending_depth:
+                    min_pending_depth = min(pending_depth_counts.keys(), default=None)
+            return candidate_to_expand
+
         while len(candidates_stack) > 0:
-            if self.is_gpu_np and use_bitset_masks:
+            if use_gpu_batching:
                 batch = []
                 while candidates_stack and len(batch) < effective_gpu_batch_size:
-                    candidate = candidates_stack.pop()
-                    depth = len(candidate['ar_prefix'])
-                    pending_depth_counts[depth] -= 1
-                    if pending_depth_counts[depth] <= 0:
-                        pending_depth_counts.pop(depth, None)
-                        if depth == min_pending_depth:
-                            min_pending_depth = min(pending_depth_counts.keys(), default=None)
-                    batch.append(candidate)
+                    batch.append(pop_next_candidate())
                 new_candidates = candidate_generator.generate_candidates_batch(
                     batch,
                     stop_list=stop_list,
@@ -716,13 +647,7 @@ class ActionRules:
                     batch_size=effective_gpu_batch_size,
                 )
             else:
-                candidate = candidates_stack.pop()
-                depth = len(candidate['ar_prefix'])
-                pending_depth_counts[depth] -= 1
-                if pending_depth_counts[depth] <= 0:
-                    pending_depth_counts.pop(depth, None)
-                    if depth == min_pending_depth:
-                        min_pending_depth = min(pending_depth_counts.keys(), default=None)
+                candidate = pop_next_candidate()
                 new_candidates = candidate_generator.generate_candidates(
                     **candidate,
                     stop_list=stop_list,
@@ -849,45 +774,6 @@ class ActionRules:
             stop_list.append(tuple([item, item]))
         return stop_list
 
-    def get_split_tables(
-        self,
-        data: Union['numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix', 'scipy.sparse.csr_matrix'],
-        target_items_binding: dict,
-        target: str,
-        use_sparse_matrix: bool = False,
-    ) -> dict:
-        """
-        Split the dataset into tables based on target item bindings.
-
-        Parameters
-        ----------
-        data : Union['numpy.ndarray', 'cupy.ndarray', 'cupyx.scipy.sparse.csr_matrix', 'scipy.sparse.csr_matrix']
-            The dataset to be split.
-        target_items_binding : dict
-            Dictionary containing bindings for target items.
-        target : str
-            The target attribute.
-        use_sparse_matrix : bool, optional
-            If True, a sparse matrix is used. Default is False.
-
-        Returns
-        -------
-        dict
-            A dictionary containing the split tables.
-
-        Notes
-        -----
-        The method creates masks for the target items and splits the data accordingly.
-        """
-        frames = {}
-        for item in target_items_binding[target]:
-            mask = data[item] == 1
-            if use_sparse_matrix:
-                frames[item] = data.multiply(mask)  # type: ignore
-            else:
-                frames[item] = data[:, mask]
-        return frames
-
     def get_split_bit_masks(self, target_items_binding: dict, target: str) -> dict:
         """
         Return packed bit-mask rows for each target state.
@@ -906,11 +792,10 @@ class ActionRules:
 
         Notes
         -----
-        Requires that `build_bit_masks` has been executed beforehand (i.e., fit was called
-        without the sparse path => data is stored in dense format).
+        Requires that `build_bit_masks` has been executed beforehand.
         """
         if self.bit_masks is None:
-            raise RuntimeError("Bit masks are not available. Ensure fit() was run without sparse matrices.")
+            raise RuntimeError("Bit masks are not available. Ensure fit() was run first.")
 
         target_state_masks = {}
         for item_index in target_items_binding.get(target, []):

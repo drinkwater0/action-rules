@@ -71,7 +71,6 @@ action_rules.fit(
     target=target,
     target_undesired_state=undesired_state,
     target_desired_state=desired_state,
-    use_sparse_matrix=True,  # needs SciPy or Cupyx (if use_gpu is True) installed
     use_gpu=False,  # needs Cupy installed
 )
 # Print rules
@@ -100,10 +99,8 @@ $ action-rules --min_stable_attributes 2 --min_flexible_attributes 1 --min_undes
 
 ## Performance
 
-* [Customer Churn (GPU vs. CPU, sparse matrix vs. dense matrix, Pandas vs. cuDF)](https://github.com/lukassykora/action-rules/blob/main/notebooks/Performance.ipynb)
-* [Scalene Profiling](https://github.com/lukassykora/action-rules/blob/main/notebooks/profiling/plot.ipynb)
-* [GPU Memory Usage - Sparse vs. Dense Matrix](https://github.com/lukassykora/action-rules/blob/main/notebooks/gpu_sparse_vs_dense/process_logs.ipynb)
-* [CPU Usage](https://github.com/lukassykora/action-rules/blob/main/notebooks/cpu_cores/cpu_usage.ipynb)
+* [Scalene Profiling Runner (CPU/GPU bitset)](https://github.com/lukassykora/action-rules/blob/main/notebooks/profiling/process_logs.ipynb)
+* [Scalene Profiling Plots (CPU/GPU bitset)](https://github.com/lukassykora/action-rules/blob/main/notebooks/profiling/plot.ipynb)
 * [Compare the Action-Rules package with ActionRulesDiscovery package](https://github.com/lukassykora/action-rules/blob/main/notebooks/Comparison.ipynb) - link to ActionRulesDiscovery package: <https://github.com/lukassykora/actionrules>
 
 ## Credits
