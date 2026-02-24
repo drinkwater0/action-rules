@@ -18,7 +18,10 @@ if str(SRC_DIR) not in sys.path:
 from action_rules import ActionRules
 
 
-def run_cpu_bitset(repeat_factor: int = 20, verbose: bool = False) -> tuple[int, float]:
+def run_cpu_bitset(
+    repeat_factor: int = 20,
+    verbose: bool = False,
+) -> tuple[int, float]:
     """Execute one CPU bitset mining run and return (rule_count, elapsed_seconds)."""
     stable_attributes = ["gender", "SeniorCitizen", "Partner"]
     flexible_attributes = [
@@ -84,7 +87,10 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true", help="Enable verbose mining output.")
     args = parser.parse_args()
 
-    run_cpu_bitset(repeat_factor=args.repeat_factor, verbose=args.verbose)
+    run_cpu_bitset(
+        repeat_factor=args.repeat_factor,
+        verbose=args.verbose,
+    )
 
 
 if __name__ == "__main__":
