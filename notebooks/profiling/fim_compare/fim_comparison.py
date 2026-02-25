@@ -180,6 +180,34 @@ def _popcount_uint64_1d(words: np.ndarray) -> int:
     return int(((x * h01) >> np.uint64(56)).sum(dtype=np.uint64))
 
 
+def _popcount_uint64_rows(words: np.ndarray) -> np.ndarray:
+    """Row-wise popcount for uint64 matrix. Returns int64 vector [n_rows]."""
+    if words.ndim != 2:
+        raise ValueError(f"Expected 2D array, got shape={words.shape}")
+    if words.shape[0] == 0:
+        return np.zeros(0, dtype=np.int64)
+    if words.shape[1] == 0:
+        return np.zeros(words.shape[0], dtype=np.int64)
+
+    x = words.astype(np.uint64, copy=True)
+    if hasattr(np, "bitwise_count"):
+        counts = np.bitwise_count(x).sum(axis=1, dtype=np.uint64)
+        return counts.astype(np.int64, copy=False)
+    if hasattr(x, "bit_count"):
+        counts = x.bit_count().sum(axis=1, dtype=np.uint64)  # type: ignore[call-arg]
+        return counts.astype(np.int64, copy=False)
+
+    m1 = np.uint64(0x5555555555555555)
+    m2 = np.uint64(0x3333333333333333)
+    m4 = np.uint64(0x0F0F0F0F0F0F0F0F)
+    h01 = np.uint64(0x0101010101010101)
+    x = x - ((x >> np.uint64(1)) & m1)
+    x = (x & m2) + ((x >> np.uint64(2)) & m2)
+    x = (x + (x >> np.uint64(4))) & m4
+    counts = ((x * h01) >> np.uint64(56)).sum(axis=1, dtype=np.uint64)
+    return counts.astype(np.int64, copy=False)
+
+
 def _popcount_uint64_1d_gpu(words) -> int:
     try:
         cp = importlib.import_module("cupy")
@@ -199,6 +227,67 @@ def _popcount_uint64_1d_gpu(words) -> int:
     return int(counts.sum(dtype=cp.uint64).item())
 
 
+def _supports_for_candidates_cpu(
+    bit_masks: np.ndarray,
+    itemsets: list[tuple[int, ...]],
+    *,
+    chunk_size: int = 4096,
+) -> list[int]:
+    if not itemsets:
+        return []
+    if chunk_size <= 0:
+        chunk_size = len(itemsets)
+
+    supports: list[int] = []
+    for start in range(0, len(itemsets), chunk_size):
+        chunk = itemsets[start : start + chunk_size]
+        idx = np.asarray(chunk, dtype=np.intp)
+        mask_batch = bit_masks[idx[:, 0]].copy()
+        for col in range(1, idx.shape[1]):
+            mask_batch &= bit_masks[idx[:, col]]
+        counts = _popcount_uint64_rows(mask_batch)
+        supports.extend(int(v) for v in counts.tolist())
+    return supports
+
+
+def _supports_for_candidates_gpu(
+    bit_masks,
+    itemsets: list[tuple[int, ...]],
+    *,
+    chunk_size: int = 8192,
+) -> list[int]:
+    try:
+        cp = importlib.import_module("cupy")
+    except Exception as exc:
+        raise RuntimeError(f"CuPy is not available: {type(exc).__name__}: {exc}") from exc
+
+    if not itemsets:
+        return []
+    if chunk_size <= 0:
+        chunk_size = len(itemsets)
+
+    supports: list[int] = []
+    for start in range(0, len(itemsets), chunk_size):
+        chunk = itemsets[start : start + chunk_size]
+        idx_cpu = np.asarray(chunk, dtype=np.int32)
+        idx = cp.asarray(idx_cpu, dtype=cp.int32)
+        mask_batch = bit_masks[idx[:, 0]].copy()
+        for col in range(1, int(idx.shape[1])):
+            mask_batch &= bit_masks[idx[:, col]]
+        try:
+            counts = cp.bitwise_count(mask_batch).sum(axis=1, dtype=cp.uint64)
+        except Exception:
+            if hasattr(mask_batch, "bit_count"):
+                counts = mask_batch.bit_count().sum(axis=1, dtype=cp.uint64)  # type: ignore[call-arg]
+            else:
+                counts_cpu = _popcount_uint64_rows(cp.asnumpy(mask_batch))
+                counts = cp.asarray(counts_cpu, dtype=cp.uint64)
+        counts_cpu = cp.asnumpy(counts).astype(np.int64, copy=False)
+        supports.extend(int(v) for v in counts_cpu.tolist())
+    _sync_cupy_default_stream()
+    return supports
+
+
 def _pack_bool_rows_to_uint64(bool_rows: np.ndarray) -> np.ndarray:
     """Pack rows of {0,1} matrix into uint64 words."""
     n_rows = bool_rows.shape[1]
@@ -215,9 +304,13 @@ def _mine_itemsets_and_rules(
     min_support_count: int,
     min_confidence: float,
     max_len: int,
-    support_fn: Callable[[tuple[int, ...]], int],
+    support_fn: Callable[[tuple[int, ...]], int] | None = None,
+    batch_support_fn: Callable[[list[tuple[int, ...]]], list[int]] | None = None,
     finalize_timing_hook: Callable[[], None] | None = None,
 ) -> tuple[int, int, float]:
+    if support_fn is None and batch_support_fn is None:
+        raise ValueError("Either support_fn or batch_support_fn must be provided.")
+
     started = perf_counter()
     support_map: dict[tuple[int, ...], int] = {}
 
@@ -267,11 +360,25 @@ def _mine_itemsets_and_rules(
                 unique_candidates.append(cand)
 
         frequent_next = []
-        for cand in unique_candidates:
-            supp = support_fn(cand)
-            if supp >= min_support_count:
-                support_map[cand] = supp
-                frequent_next.append(cand)
+        if batch_support_fn is not None:
+            supports = batch_support_fn(unique_candidates)
+            if len(supports) != len(unique_candidates):
+                raise RuntimeError(
+                    "Batch support function returned mismatched count: "
+                    f"{len(supports)} vs {len(unique_candidates)} candidates."
+                )
+            for cand, supp in zip(unique_candidates, supports):
+                supp_i = int(supp)
+                if supp_i >= min_support_count:
+                    support_map[cand] = supp_i
+                    frequent_next.append(cand)
+        else:
+            assert support_fn is not None
+            for cand in unique_candidates:
+                supp = support_fn(cand)
+                if supp >= min_support_count:
+                    support_map[cand] = supp
+                    frequent_next.append(cand)
 
         frequent_prev = frequent_next
 
@@ -326,6 +433,9 @@ class BitsetFIMCPU:
             mask &= self.bit_masks[idx]
         return _popcount_uint64_1d(mask)
 
+    def _supports_for_itemsets(self, itemsets: list[tuple[int, ...]]) -> list[int]:
+        return _supports_for_candidates_cpu(self.bit_masks, itemsets)
+
     def mine_association_rules(
         self,
         min_support_count: int,
@@ -337,7 +447,7 @@ class BitsetFIMCPU:
             min_support_count=min_support_count,
             min_confidence=min_confidence,
             max_len=max_len,
-            support_fn=self._support_for_itemset,
+            batch_support_fn=self._supports_for_itemsets,
         )
 
 
@@ -378,6 +488,9 @@ class BitsetFIMGPU:
             mask &= self.bit_masks[idx]
         return _popcount_uint64_1d_gpu(mask)
 
+    def _supports_for_itemsets(self, itemsets: list[tuple[int, ...]]) -> list[int]:
+        return _supports_for_candidates_gpu(self.bit_masks, itemsets)
+
     def mine_association_rules(
         self,
         min_support_count: int,
@@ -389,7 +502,7 @@ class BitsetFIMGPU:
             min_support_count=min_support_count,
             min_confidence=min_confidence,
             max_len=max_len,
-            support_fn=self._support_for_itemset,
+            batch_support_fn=self._supports_for_itemsets,
             finalize_timing_hook=_sync_cupy_default_stream,
         )
 
