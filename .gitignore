@@ -115,3 +115,7 @@ site/
 
 # Markdown
 *.md
+
+# Profiling outputs (dataset size)
+notebooks/profiling/dataset_size/data/*.json
+notebooks/profiling/dataset_size/data/*.jsonl
