@@ -99,8 +99,9 @@ $ action-rules --min_stable_attributes 2 --min_flexible_attributes 1 --min_undes
 
 ## Performance
 
-* [Scalene Profiling Runner (CPU/GPU bitset)](https://github.com/lukassykora/action-rules/blob/main/notebooks/profiling/process_logs.ipynb)
-* [Scalene Profiling Plots (CPU/GPU bitset)](https://github.com/lukassykora/action-rules/blob/main/notebooks/profiling/plot.ipynb)
+* [`notebooks/profiling/profile_telco_bitset.py`](https://github.com/lukassykora/action-rules/blob/main/notebooks/profiling/profile_telco_bitset.py) - single-dataset CPU/GPU bitset runtime runner
+* [`notebooks/profiling/run_comparison_suites.py`](https://github.com/lukassykora/action-rules/blob/main/notebooks/profiling/run_comparison_suites.py) - thesis-oriented suite runner for rule search and CPU/GPU comparisons
+* [`notebooks/profiling/plot_comparison_suites.py`](https://github.com/lukassykora/action-rules/blob/main/notebooks/profiling/plot_comparison_suites.py) - plot generation for saved suite summaries
 * [Compare the Action-Rules package with ActionRulesDiscovery package](https://github.com/lukassykora/action-rules/blob/main/notebooks/Comparison.ipynb) - link to ActionRulesDiscovery package: <https://github.com/lukassykora/actionrules>
 
 ## Credits

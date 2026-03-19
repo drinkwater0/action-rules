@@ -119,3 +119,16 @@ site/
 # Profiling outputs (dataset size)
 notebooks/profiling/dataset_size/data/*.json
 notebooks/profiling/dataset_size/data/*.jsonl
+
+# Local benchmarking artifacts
+.tmp_pkg_inspect/
+notebooks/profiling/comparison_suites/
+notebooks/profiling/*_bitset/scalene_report_*.json
+notebooks/profiling/*_bitset/scalene_report_*.html
+
+# Local benchmark datasets
+notebooks/data/adult.csv
+notebooks/data/bank-full.csv
+notebooks/data/census_income.csv
+notebooks/data/covtype.csv
+notebooks/data/german.csv

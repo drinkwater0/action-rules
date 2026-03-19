@@ -9,10 +9,10 @@ from profile_telco_bitset import _write_metrics, run_profile
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run GPU bitset profiling workload.")
     parser.add_argument(
-        "--repeat-factor",
-        type=int,
-        default=20,
-        help="How many times to concatenate the source dataset.",
+        "--dataset",
+        type=str,
+        default="bank",
+        help="Dataset preset: bank,german,covtype,telco",
     )
     parser.add_argument(
         "--max-gpu-mem-mb",
@@ -48,7 +48,8 @@ def main() -> None:
 
     result = run_profile(
         use_gpu=True,
-        repeat_factor=args.repeat_factor,
+        dataset=args.dataset,
+        repeat_factor=1,
         max_gpu_mem_mb=args.max_gpu_mem_mb,
         gpu_batch_size=args.gpu_batch_size,
         verbose=args.verbose,
