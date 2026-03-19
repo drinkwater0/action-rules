@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 """Tests for `action_rules` package."""
 
+import json
+
 import pytest
 
 from action_rules.output import Output
@@ -119,6 +121,21 @@ def test_get_export_notation(output_instance):
     assert '"attribute": "status"' in export_notation
     assert '"undesired": "default"' in export_notation
     assert '"desired": "paid"' in export_notation
+
+
+def test_get_export_notation_preserves_utility_precision(output_instance):
+    """
+    Utility metrics should keep their float precision in exported JSON.
+    """
+    output_instance.action_rules[0]['max_rule_gain'] = 8.5
+    output_instance.action_rules[0]['realistic_rule_gain'] = 4.9
+    output_instance.action_rules[0]['realistic_dataset_gain'] = 61.25
+
+    exported = json.loads(output_instance.get_export_notation())
+
+    assert exported[0]['max_rule_gain'] == 8.5
+    assert exported[0]['realistic_rule_gain'] == 4.9
+    assert exported[0]['realistic_dataset_gain'] == 61.25
 
 
 def test_get_pretty_ar_notation(output_instance):
@@ -275,3 +292,15 @@ def test_get_dominant_rules(output_instance_dominant_test):
     #   -> index=2 (uplift=0.3) should be first, then index=0 (uplift=0.2).
 
     assert dominant_indices == [2, 0], f"Expected dominant indices [2, 0], but got {dominant_indices}"
+
+
+def test_get_dominant_rules_does_not_mutate_action_rules(output_instance_dominant_test):
+    """
+    Dominance ranking should not inject helper fields into stored rules.
+    """
+    output_instance_dominant_test.get_dominant_rules()
+
+    for rule in output_instance_dominant_test.action_rules:
+        assert 'candidate_set' not in rule
+        assert 'rule_index' not in rule
+        assert 'to_delete' not in rule

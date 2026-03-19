@@ -2,7 +2,7 @@
 
 import itertools
 import warnings
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Optional, Union  # noqa
 
 from .candidates.candidate_generator import CandidateGenerator
@@ -437,7 +437,6 @@ class ActionRules:
         gpu_batch_size : int, optional
             Optional number of candidate contexts processed per GPU bitset batch.
             If None, defaults to 32 on the GPU bitset path.
-
         Notes
         -----
         This method expects boolean/binary one-hot columns.
@@ -521,7 +520,6 @@ class ActionRules:
         gpu_batch_size : int, optional
             Optional number of candidate contexts processed per GPU bitset batch.
             If None, defaults to 32 on the GPU bitset path.
-
         Raises
         ------
         RuntimeError
@@ -578,17 +576,16 @@ class ActionRules:
 
         stop_list_itemset = set()  # type: set
 
-        candidates_stack = [
-            {
-                'ar_prefix': tuple(),
-                'itemset_prefix': tuple(),
-                'stable_items_binding': stable_items_binding,
-                'flexible_items_binding': flexible_items_binding,
-                'undesired_mask_bitset': None,
-                'desired_mask_bitset': None,
-                'actionable_attributes': 0,
-            }
-        ]
+        initial_candidate = {
+            'ar_prefix': tuple(),
+            'itemset_prefix': tuple(),
+            'stable_items_binding': stable_items_binding,
+            'flexible_items_binding': flexible_items_binding,
+            'undesired_mask_bitset': None,
+            'desired_mask_bitset': None,
+            'actionable_attributes': 0,
+        }
+        candidates_pool = deque([initial_candidate])
         pending_depth_counts = {0: 1}
         min_pending_depth = 0
         max_depth_seen = 0
@@ -623,7 +620,7 @@ class ActionRules:
             Pop one pending candidate and keep pending-depth bookkeeping in sync.
             """
             nonlocal min_pending_depth
-            candidate_to_expand = candidates_stack.pop()
+            candidate_to_expand = candidates_pool.popleft()
             depth = len(candidate_to_expand['ar_prefix'])
             pending_depth_counts[depth] -= 1
             if pending_depth_counts[depth] <= 0:
@@ -632,10 +629,10 @@ class ActionRules:
                     min_pending_depth = min(pending_depth_counts.keys(), default=None)
             return candidate_to_expand
 
-        while len(candidates_stack) > 0:
+        while len(candidates_pool) > 0:
             if use_gpu_batching:
                 batch = []
-                while candidates_stack and len(batch) < effective_gpu_batch_size:
+                while candidates_pool and len(batch) < effective_gpu_batch_size:
                     batch.append(pop_next_candidate())
                 new_candidates = candidate_generator.generate_candidates_batch(
                     batch,
@@ -657,7 +654,7 @@ class ActionRules:
                     verbose=self.verbose,
                 )
             if new_candidates:
-                candidates_stack.extend(new_candidates)
+                candidates_pool.extend(new_candidates)
                 for new_candidate in new_candidates:
                     new_depth = len(new_candidate['ar_prefix'])
                     pending_depth_counts[new_depth] = pending_depth_counts.get(new_depth, 0) + 1

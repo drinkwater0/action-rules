@@ -97,6 +97,7 @@ class Rules:
         self.count_transactions = count_transactions
         self.intrinsic_utility_table = intrinsic_utility_table or {}
         self.transition_utility_table = transition_utility_table or {}
+        self.has_utility_tables = bool(self.intrinsic_utility_table or self.transition_utility_table)
 
     def add_prefix_without_conf(self, prefix: tuple, is_desired: bool):
         """
@@ -191,8 +192,8 @@ class Rules:
                         desired_rule['confidence'],
                     )
                     # Utility
-                    utility = None
-                    if self.intrinsic_utility_table is not None or self.transition_utility_table is not None:
+                    utility = {}
+                    if self.has_utility_tables:
                         (max_rule_gain, realistic_rule_gain, realistic_rule_gain_dataset) = self.compute_rule_utility(
                             undesired_rule, desired_rule
                         )
