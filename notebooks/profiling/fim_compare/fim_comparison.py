@@ -27,9 +27,14 @@ import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TELCO_PATH = REPO_ROOT / "notebooks" / "data" / "telco.csv"
+DEFAULT_DATASET_PATHS = [
+    REPO_ROOT / "notebooks" / "data" / "bank-full.csv",
+    REPO_ROOT / "notebooks" / "data" / "german.csv",
+    REPO_ROOT / "notebooks" / "data" / "covtype.csv",
+]
 
-# Columns used for transaction representation.
-TX_COLUMNS = [
+# Default Telco columns used for transaction representation.
+DEFAULT_TELCO_COLUMNS = [
     "gender",
     "SeniorCitizen",
     "Partner",
@@ -91,6 +96,36 @@ def _parse_algorithms(raw: str) -> list[str]:
     return values
 
 
+def _parse_path_list(raw: str) -> list[Path]:
+    values = []
+    for token in raw.split(","):
+        token = token.strip()
+        if token:
+            values.append(Path(token).expanduser())
+    if not values:
+        raise ValueError("Expected at least one dataset path.")
+    return values
+
+
+def _parse_optional_columns(raw: str) -> list[str] | None:
+    value = raw.strip()
+    if not value:
+        return None
+    if value.lower() in {"auto", "all"}:
+        return None
+    columns = [token.strip() for token in value.split(",") if token.strip()]
+    if not columns:
+        return None
+    return columns
+
+
+def _default_existing_dataset_paths() -> list[Path]:
+    existing = [path for path in DEFAULT_DATASET_PATHS if path.exists()]
+    if existing:
+        return existing
+    return [TELCO_PATH]
+
+
 def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
@@ -134,24 +169,78 @@ def _sync_cupy_default_stream() -> None:
         return
 
 
-def _load_telco(repeat_factor: int) -> pd.DataFrame:
-    frame = pd.read_csv(TELCO_PATH, sep=";")
-    if repeat_factor > 1:
-        frame = pd.concat([frame] * repeat_factor, ignore_index=True)
+def _detect_separator(path: Path) -> str:
+    sample = path.read_text(encoding="utf-8", errors="ignore")[:65536]
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        return dialect.delimiter
+    except Exception:
+        # Telco dataset in this repository is semicolon-delimited.
+        if path.name.lower() == "telco.csv":
+            return ";"
+        return ","
+
+
+def _load_dataset(dataset_path: Path, dataset_sep: str = "auto") -> pd.DataFrame:
+    if dataset_sep == "auto":
+        sep = _detect_separator(dataset_path)
+    else:
+        sep = dataset_sep
+    frame = pd.read_csv(dataset_path, sep=sep)
     return frame
+
+
+def _resolve_tx_columns(
+    frame: pd.DataFrame,
+    *,
+    dataset_path: Path,
+    tx_columns: list[str] | None,
+) -> list[str]:
+    if tx_columns is not None:
+        missing = [col for col in tx_columns if col not in frame.columns]
+        if missing:
+            raise ValueError(f"Selected tx columns not found in dataset: {missing}")
+        return tx_columns
+
+    frame_cols = frame.columns.tolist()
+    try:
+        is_telco = dataset_path.resolve() == TELCO_PATH.resolve()
+    except Exception:
+        is_telco = False
+
+    if is_telco and all(col in frame_cols for col in DEFAULT_TELCO_COLUMNS):
+        return list(DEFAULT_TELCO_COLUMNS)
+
+    # For generic datasets, use all columns except obvious row identifiers.
+    excluded = {
+        "id",
+        "tid",
+        "transactionid",
+        "transaction_id",
+        "rowid",
+        "row_id",
+        "fnlwgt",
+        "marsupwt",
+        "instance_weight",
+    }
+    selected = [col for col in frame_cols if str(col).strip().lower() not in excluded]
+    if not selected:
+        raise ValueError("No transaction columns left after auto-selection.")
+    return selected
 
 
 def _build_transactions(tx_frame: pd.DataFrame) -> list[list[str]]:
     # Build transactions as "column=value" tokens, vectorized by columns.
     token_cols = []
-    for col in TX_COLUMNS:
+    for col in tx_frame.columns:
         token_cols.append((col + "=" + tx_frame[col]).to_numpy(dtype=object))
     matrix = np.column_stack(token_cols)
     return matrix.tolist()
 
 
 def _build_onehot_frame(tx_frame: pd.DataFrame) -> pd.DataFrame:
-    return pd.get_dummies(tx_frame, columns=TX_COLUMNS, prefix=TX_COLUMNS, prefix_sep="=").astype(bool)
+    columns = tx_frame.columns.tolist()
+    return pd.get_dummies(tx_frame, columns=columns, prefix=columns, prefix_sep="=").astype(bool)
 
 
 def _min_support_ratio(min_support_count: int, n_transactions: int) -> float:
@@ -981,14 +1070,14 @@ def summarize_records(records: list[dict]) -> pd.DataFrame:
     if ok.empty:
         return pd.DataFrame()
     summary = (
-        ok.groupby(["algorithm", "repeat_factor"], as_index=False)
+        ok.groupby(["dataset_path", "algorithm"], as_index=False)
         .agg(
             runs=("elapsed_seconds", "count"),
             mean_s=("elapsed_seconds", "mean"),
             median_s=("elapsed_seconds", "median"),
             std_s=("elapsed_seconds", lambda x: float(x.std(ddof=1)) if len(x) > 1 else 0.0),
         )
-        .sort_values(["repeat_factor", "algorithm"])
+        .sort_values(["dataset_path", "algorithm"])
     )
     return summary
 
@@ -999,6 +1088,7 @@ def run_benchmark(
     runs: int,
     algorithms: list[str],
     min_support_count: int,
+    min_support_ratio: float | None = None,
     min_confidence: float,
     max_len: int,
     max_apyori_records: int,
@@ -1011,6 +1101,10 @@ def run_benchmark(
     cpp_fim_cmd: str = "",
     cpp_timeout_sec: int = 300,
     warmup_runs: int = 0,
+    dataset_paths: list[Path] | None = None,
+    dataset_path: Path = TELCO_PATH,
+    dataset_sep: str = "auto",
+    tx_columns: list[str] | None = None,
 ) -> tuple[list[dict], dict[str, Path]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -1027,6 +1121,17 @@ def run_benchmark(
     records: list[dict] = []
     run_count = max(1, int(runs))
     warmup_count = max(0, int(warmup_runs))
+    if any(int(x) != 1 for x in repeat_factors):
+        raise ValueError(
+            "repeat_factors > 1 are not supported anymore. "
+            "Synthetic dataset multiplication is disabled; use multiple real datasets via dataset_paths."
+        )
+    effective_repeat_factor = 1
+    effective_dataset_paths = (
+        [Path(p).expanduser().resolve() for p in dataset_paths]
+        if dataset_paths
+        else [Path(dataset_path).expanduser().resolve()]
+    )
     algorithms = [ALGORITHM_ALIASES.get(a, a) for a in algorithms]
     interrupted = False
 
@@ -1038,11 +1143,31 @@ def run_benchmark(
         _append_csv_row(latest_csv, row)
 
     try:
-        for repeat_factor in repeat_factors:
-            print(f"\nPreparing data for repeat_factor={repeat_factor}")
-            frame = _load_telco(repeat_factor=repeat_factor)
+        for current_dataset_path in effective_dataset_paths:
+            print(f"\nPreparing data for dataset={current_dataset_path}")
+            frame = _load_dataset(
+                dataset_path=current_dataset_path,
+                dataset_sep=dataset_sep,
+            )
             rows = int(frame.shape[0])
-            tx_frame = frame[TX_COLUMNS].astype(str)
+            effective_min_support_ratio = (
+                float(min_support_ratio) if min_support_ratio is not None else None
+            )
+            if effective_min_support_ratio is not None:
+                if not (0.0 < effective_min_support_ratio <= 1.0):
+                    raise ValueError(
+                        f"min_support_ratio must be in (0, 1], got {effective_min_support_ratio}"
+                    )
+                effective_min_support_count = max(1, int(np.ceil(effective_min_support_ratio * rows)))
+            else:
+                effective_min_support_count = int(min_support_count)
+                effective_min_support_ratio = _min_support_ratio(effective_min_support_count, rows)
+            selected_tx_columns = _resolve_tx_columns(
+                frame,
+                dataset_path=current_dataset_path,
+                tx_columns=tx_columns,
+            )
+            tx_frame = frame[selected_tx_columns].astype(str)
 
             tx_started = perf_counter()
             transactions = _build_transactions(tx_frame)
@@ -1084,6 +1209,10 @@ def run_benchmark(
             print(
                 "rows="
                 f"{rows}, tx_prep_seconds={tx_prep_seconds:.4f}, "
+                f"dataset={current_dataset_path}, "
+                f"min_support_count={effective_min_support_count}, "
+                f"min_support_ratio={effective_min_support_ratio:.8f}, "
+                f"tx_columns={len(selected_tx_columns)}, "
                 f"bitset_cpu_prep_seconds={bitset_cpu_prep_seconds}, "
                 f"bitset_gpu_prep_seconds={bitset_gpu_prep_seconds}, "
                 f"mlxtend_prep_seconds={mlxtend_prep_seconds}, "
@@ -1094,7 +1223,8 @@ def run_benchmark(
                 temp_dir_path = Path(temp_dir)
                 external_input_path = None
                 if needs_external_input and integer_transactions is not None:
-                    external_input_path = temp_dir_path / f"transactions_repeat{repeat_factor}.txt"
+                    dataset_slug = current_dataset_path.stem
+                    external_input_path = temp_dir_path / f"transactions_{dataset_slug}.txt"
                     _write_integer_transactions(external_input_path, integer_transactions)
 
                 def _run_algorithm(algo: str, run_index: int) -> dict:
@@ -1102,7 +1232,7 @@ def run_benchmark(
                         assert bitset_cpu_model is not None
                         return _run_bitset_fim_cpu(
                             model=bitset_cpu_model,
-                            min_support_count=min_support_count,
+                            min_support_count=effective_min_support_count,
                             min_confidence=min_confidence,
                             max_len=max_len,
                         )
@@ -1110,14 +1240,14 @@ def run_benchmark(
                         return _run_bitset_fim_gpu(
                             model=bitset_gpu_model,
                             model_error=bitset_gpu_model_error,
-                            min_support_count=min_support_count,
+                            min_support_count=effective_min_support_count,
                             min_confidence=min_confidence,
                             max_len=max_len,
                         )
                     if algo == "apyori":
                         return _run_apyori(
                             transactions=transactions,
-                            min_support_count=min_support_count,
+                            min_support_count=effective_min_support_count,
                             min_confidence=min_confidence,
                             max_len=max_len,
                             max_records=max_apyori_records,
@@ -1126,14 +1256,14 @@ def run_benchmark(
                         return _run_pyfim_itemsets(
                             method_name="apriori",
                             transactions=transactions,
-                            min_support_count=min_support_count,
+                            min_support_count=effective_min_support_count,
                             max_len=max_len,
                         )
                     if algo == "pyfim_eclat":
                         return _run_pyfim_itemsets(
                             method_name="eclat",
                             transactions=transactions,
-                            min_support_count=min_support_count,
+                            min_support_count=effective_min_support_count,
                             max_len=max_len,
                         )
                     if algo == "mlxtend_apriori":
@@ -1142,7 +1272,7 @@ def run_benchmark(
                         return _run_mlxtend_itemsets(
                             method_name="apriori",
                             onehot=mlxtend_onehot,
-                            min_support_count=min_support_count,
+                            min_support_count=effective_min_support_count,
                             min_confidence=min_confidence,
                             max_len=max_len,
                         )
@@ -1152,7 +1282,7 @@ def run_benchmark(
                         return _run_mlxtend_itemsets(
                             method_name="fpgrowth",
                             onehot=mlxtend_onehot,
-                            min_support_count=min_support_count,
+                            min_support_count=effective_min_support_count,
                             min_confidence=min_confidence,
                             max_len=max_len,
                         )
@@ -1165,7 +1295,7 @@ def run_benchmark(
                             spmf_algorithm=spmf_fpgrowth_algo,
                             input_path=external_input_path,
                             output_path=spmf_out,
-                            min_support_count=min_support_count,
+                            min_support_count=effective_min_support_count,
                             n_transactions=rows,
                             max_len=max_len,
                             timeout_sec=spmf_timeout_sec,
@@ -1179,7 +1309,7 @@ def run_benchmark(
                             spmf_algorithm=spmf_eclat_algo,
                             input_path=external_input_path,
                             output_path=spmf_out,
-                            min_support_count=min_support_count,
+                            min_support_count=effective_min_support_count,
                             n_transactions=rows,
                             max_len=max_len,
                             timeout_sec=spmf_timeout_sec,
@@ -1192,7 +1322,7 @@ def run_benchmark(
                             cpp_fim_cmd=cpp_fim_cmd,
                             input_path=external_input_path,
                             output_path=cpp_out,
-                            min_support_count=min_support_count,
+                            min_support_count=effective_min_support_count,
                             n_transactions=rows,
                             max_len=max_len,
                             timeout_sec=cpp_timeout_sec,
@@ -1200,25 +1330,29 @@ def run_benchmark(
                     raise ValueError(f"Unsupported algorithm: {algo}")
 
                 if warmup_count > 0:
-                    print(f"repeat={repeat_factor} warmup_runs={warmup_count}")
+                    print(f"dataset={current_dataset_path} warmup_runs={warmup_count}")
                     for warmup_index in range(warmup_count):
-                        print(f"repeat={repeat_factor} warmup={warmup_index + 1}/{warmup_count}")
+                        print(f"dataset={current_dataset_path} warmup={warmup_index + 1}/{warmup_count}")
                         for algo in algorithms:
                             _run_algorithm(algo=algo, run_index=-(warmup_index + 1))
                     _sync_cupy_default_stream()
 
                 for run_index in range(run_count):
                     run_no = run_index + 1
-                    print(f"repeat={repeat_factor} run={run_no}/{run_count}")
+                    print(f"dataset={current_dataset_path} run={run_no}/{run_count}")
 
                     for algo in algorithms:
                         result = _run_algorithm(algo=algo, run_index=run_index)
                         row = {
                             "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                             "algorithm": algo,
-                            "repeat_factor": int(repeat_factor),
+                            "dataset_path": str(current_dataset_path),
+                            "tx_columns_count": int(len(selected_tx_columns)),
+                            "repeat_factor": int(effective_repeat_factor),
                             "run_index": int(run_index),
                             "rows": rows,
+                            "min_support_count_effective": int(effective_min_support_count),
+                            "min_support_ratio_effective": float(effective_min_support_ratio),
                             "tx_prep_seconds": float(tx_prep_seconds),
                             "bitset_prep_seconds": (
                                 None if bitset_cpu_prep_seconds is None else float(bitset_cpu_prep_seconds)
@@ -1257,13 +1391,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Benchmark bitset FIM (CPU/GPU) against Python/Java/C++ baselines."
     )
-    parser.add_argument("--repeat-factors", type=str, default="20,200", help="Comma-separated repeat factors.")
-    parser.add_argument("--runs", type=int, default=5, help="Runs per repeat factor.")
+    parser.add_argument(
+        "--repeat-factors",
+        type=str,
+        default="1",
+        help="Deprecated scaling knob. Must be 1 (synthetic dataset multiplication is disabled).",
+    )
+    parser.add_argument("--runs", type=int, default=5, help="Runs per (dataset, algorithm).")
     parser.add_argument(
         "--warmup-runs",
         type=int,
         default=0,
-        help="Warmup runs per repeat factor (executed before measured runs, not recorded).",
+        help="Warmup runs per dataset (executed before measured runs, not recorded).",
     )
     parser.add_argument(
         "--algorithms",
@@ -1278,6 +1417,12 @@ def main() -> None:
         ),
     )
     parser.add_argument("--min-support-count", type=int, default=80, help="Minimum absolute support.")
+    parser.add_argument(
+        "--min-support-ratio",
+        type=float,
+        default=None,
+        help="Optional minimum support ratio in (0, 1]. If set, overrides --min-support-count per dataset.",
+    )
     parser.add_argument("--min-confidence", type=float, default=0.6, help="Minimum confidence.")
     parser.add_argument("--max-len", type=int, default=3, help="Maximum itemset/rule length.")
     parser.add_argument(
@@ -1332,17 +1477,49 @@ def main() -> None:
         default=Path(__file__).resolve().parent / "data",
         help="Output directory for benchmark results.",
     )
+    parser.add_argument(
+        "--dataset-path",
+        type=Path,
+        default=TELCO_PATH,
+        help="Single dataset path (used if --dataset-paths is not provided).",
+    )
+    parser.add_argument(
+        "--dataset-paths",
+        type=str,
+        default="",
+        help="Comma-separated dataset paths. If omitted, defaults to bank/german/covtype when available.",
+    )
+    parser.add_argument(
+        "--dataset-sep",
+        type=str,
+        default="auto",
+        help="Dataset separator. Use 'auto' to infer delimiter.",
+    )
+    parser.add_argument(
+        "--tx-columns",
+        type=str,
+        default="",
+        help="Comma-separated transaction columns. Empty/auto means automatic selection.",
+    )
     parser.add_argument("--tag", type=str, default="", help="Optional suffix tag for output files.")
     args = parser.parse_args()
 
     repeat_factors = _parse_int_list(args.repeat_factors)
     algorithms = _parse_algorithms(args.algorithms)
+    tx_columns = _parse_optional_columns(args.tx_columns)
+    if args.dataset_paths.strip():
+        dataset_paths = _parse_path_list(args.dataset_paths)
+    elif args.dataset_path == TELCO_PATH:
+        dataset_paths = _default_existing_dataset_paths()
+    else:
+        dataset_paths = [args.dataset_path]
 
     records, output_paths = run_benchmark(
         repeat_factors=repeat_factors,
         runs=args.runs,
         algorithms=algorithms,
         min_support_count=args.min_support_count,
+        min_support_ratio=args.min_support_ratio,
         min_confidence=args.min_confidence,
         max_len=args.max_len,
         max_apyori_records=args.max_apyori_records,
@@ -1355,6 +1532,10 @@ def main() -> None:
         cpp_fim_cmd=args.cpp_fim_cmd,
         cpp_timeout_sec=args.cpp_timeout_sec,
         warmup_runs=args.warmup_runs,
+        dataset_paths=dataset_paths,
+        dataset_path=args.dataset_path,
+        dataset_sep=args.dataset_sep,
+        tx_columns=tx_columns,
     )
 
     print("\nSaved outputs:")

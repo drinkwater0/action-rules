@@ -1,4 +1,4 @@
-"""Benchmark CPU/GPU bitset runtime across dataset-size repeat factors."""
+"""Benchmark CPU/GPU ActionRules bitset runtime across real datasets."""
 
 from __future__ import annotations
 
@@ -16,19 +16,7 @@ PROFILING_DIR = CURRENT_DIR.parent
 if str(PROFILING_DIR) not in sys.path:
     sys.path.insert(0, str(PROFILING_DIR))
 
-from profile_telco_bitset import run_profile  # noqa: E402
-
-
-def _parse_int_list(raw: str) -> list[int]:
-    values = []
-    for token in raw.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        values.append(int(token))
-    if not values:
-        raise ValueError("Expected at least one integer value.")
-    return values
+from profile_telco_bitset import list_dataset_presets, run_profile  # noqa: E402
 
 
 def _parse_modes(raw: str) -> list[str]:
@@ -44,6 +32,23 @@ def _parse_modes(raw: str) -> list[str]:
     if not modes:
         raise ValueError("Expected at least one mode.")
     return modes
+
+
+def _parse_datasets(raw: str) -> list[str]:
+    values = []
+    seen = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        key = token.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        values.append(key)
+    if not values:
+        raise ValueError("Expected at least one dataset.")
+    return values
 
 
 def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
@@ -63,18 +68,18 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run dataset-size benchmark for CPU/GPU bitset modes.")
+    parser = argparse.ArgumentParser(description="Run multi-dataset benchmark for CPU/GPU bitset modes.")
     parser.add_argument(
-        "--repeat-factors",
+        "--datasets",
         type=str,
-        default="20,200",
-        help="Comma-separated repeat factors (e.g. 1,20,100,200).",
+        default="bank,german,covtype,adult,census_income",
+        help="Comma-separated dataset presets (e.g. bank,german,covtype,adult,census_income,telco).",
     )
     parser.add_argument(
         "--runs",
         type=int,
         default=10,
-        help="Number of runs per (mode, repeat_factor).",
+        help="Number of runs per (mode, dataset).",
     )
     parser.add_argument(
         "--modes",
@@ -108,7 +113,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    repeat_factors = _parse_int_list(args.repeat_factors)
+    available_datasets = set(list_dataset_presets())
+    datasets = _parse_datasets(args.datasets)
+    unknown = [x for x in datasets if x not in available_datasets]
+    if unknown:
+        raise ValueError(f"Unsupported datasets: {unknown}. Allowed: {sorted(available_datasets)}")
     modes = _parse_modes(args.modes)
     run_count = max(1, int(args.runs))
 
@@ -121,21 +130,24 @@ def main() -> None:
     latest_csv = args.output_dir / "dataset_size_runs_latest.csv"
 
     all_rows = []
-    for mode in modes:
-        use_gpu = mode == "gpu"
-        for repeat_factor in repeat_factors:
+    for dataset in datasets:
+        for mode in modes:
+            use_gpu = mode == "gpu"
             for run_index in range(run_count):
-                print(f"mode={mode} repeat={repeat_factor} run={run_index + 1}/{run_count}")
+                print(f"dataset={dataset} mode={mode} run={run_index + 1}/{run_count}")
                 result = run_profile(
                     use_gpu=use_gpu,
-                    repeat_factor=repeat_factor,
+                    dataset=dataset,
+                    repeat_factor=1,
                     max_gpu_mem_mb=args.max_gpu_mem_mb,
                     gpu_batch_size=args.gpu_batch_size,
                     verbose=False,
                 )
                 row = {
                     "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "dataset_key": dataset,
                     "mode_key": mode,
+                    "repeat_factor": 1,
                     "run_index": run_index,
                     **result,
                 }
