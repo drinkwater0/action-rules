@@ -402,6 +402,7 @@ class ActionRules:
         target_desired_state: str,
         use_gpu: bool = False,
         max_gpu_mem_mb: Optional[int] = None,
+        gpu_node_batch_size: Optional[int] = None,
         gpu_batch_size: Optional[int] = None,
     ):
         """
@@ -434,13 +435,20 @@ class ActionRules:
         max_gpu_mem_mb : int, optional
             Optional GPU memory cap (in MB) for CuPy allocations and bitset
             support batching. If None, automatic memory-based chunking is used.
+        gpu_node_batch_size : int, optional
+            Optional number of BFS queue nodes grouped before one GPU candidate-
+            expansion pass. If None, defaults to 32 on the GPU bitset path.
         gpu_batch_size : int, optional
-            Optional number of candidate contexts processed per GPU bitset batch.
-            If None, defaults to 32 on the GPU bitset path.
+            Deprecated alias for `gpu_node_batch_size`.
         Notes
         -----
         This method expects boolean/binary one-hot columns.
         """
+        if gpu_node_batch_size is None:
+            gpu_node_batch_size = gpu_batch_size
+        elif gpu_batch_size is not None and int(gpu_node_batch_size) != int(gpu_batch_size):
+            raise ValueError("gpu_node_batch_size and gpu_batch_size must match when both are provided.")
+
         self.is_onehot = True
         data = data.copy()
         data = data.astype('bool')
@@ -480,7 +488,7 @@ class ActionRules:
             target_desired_state,
             use_gpu,
             max_gpu_mem_mb,
-            gpu_batch_size,
+            gpu_node_batch_size,
         )
 
     def fit(
@@ -493,6 +501,7 @@ class ActionRules:
         target_desired_state: str,
         use_gpu: bool = False,
         max_gpu_mem_mb: Optional[int] = None,
+        gpu_node_batch_size: Optional[int] = None,
         gpu_batch_size: Optional[int] = None,
     ):
         """
@@ -517,9 +526,11 @@ class ActionRules:
         max_gpu_mem_mb : int, optional
             Optional GPU memory cap (in MB) for CuPy allocations and bitset
             support batching. If None, automatic memory-based chunking is used.
+        gpu_node_batch_size : int, optional
+            Optional number of BFS queue nodes grouped before one GPU candidate-
+            expansion pass. If None, defaults to 32 on the GPU bitset path.
         gpu_batch_size : int, optional
-            Optional number of candidate contexts processed per GPU bitset batch.
-            If None, defaults to 32 on the GPU bitset path.
+            Deprecated alias for `gpu_node_batch_size`.
         Raises
         ------
         RuntimeError
@@ -533,6 +544,10 @@ class ActionRules:
         """
         if self.output is not None:
             raise RuntimeError("The model is already fit.")
+        if gpu_node_batch_size is None:
+            gpu_node_batch_size = gpu_batch_size
+        elif gpu_batch_size is not None and int(gpu_node_batch_size) != int(gpu_batch_size):
+            raise ValueError("gpu_node_batch_size and gpu_batch_size must match when both are provided.")
 
         # reset cached bitset structures before fitting a new model
         self.bit_masks = None
@@ -613,7 +628,9 @@ class ActionRules:
             gpu_batch_budget_mb=max_gpu_mem_mb,
             spill_gpu_masks_to_cpu=bool(self.is_gpu_np and max_gpu_mem_mb is not None),
         )
-        effective_gpu_batch_size = gpu_batch_size if gpu_batch_size is not None else 32
+        effective_gpu_node_batch_size = (
+            gpu_node_batch_size if gpu_node_batch_size is not None else 32
+        )
 
         def pop_next_candidate() -> dict:
             """
@@ -632,7 +649,7 @@ class ActionRules:
         while len(candidates_pool) > 0:
             if use_gpu_batching:
                 batch = []
-                while candidates_pool and len(batch) < effective_gpu_batch_size:
+                while candidates_pool and len(batch) < effective_gpu_node_batch_size:
                     batch.append(pop_next_candidate())
                 new_candidates = candidate_generator.generate_candidates_batch(
                     batch,
@@ -641,7 +658,7 @@ class ActionRules:
                     undesired_state=undesired_state,
                     desired_state=desired_state,
                     verbose=self.verbose,
-                    batch_size=effective_gpu_batch_size,
+                    batch_size=effective_gpu_node_batch_size,
                 )
             else:
                 candidate = pop_next_candidate()

@@ -65,12 +65,15 @@ FIM_ALGORITHMS = [
 RULE_ALGORITHMS = [
     "action_rules_cpu",
     "action_rules_gpu",
+    "action_rules_auto",
     "actionrules_sykora",
 ]
 
 RULE_ALGORITHM_ALIASES = {
     "cpu": "action_rules_cpu",
     "gpu": "action_rules_gpu",
+    "auto": "action_rules_auto",
+    "autotune": "action_rules_auto",
     "bitset_fim_cpu": "action_rules_cpu",
     "bitset_fim_gpu": "action_rules_gpu",
     "actionrules": "actionrules_sykora",
@@ -83,7 +86,20 @@ RULE_ALGORITHM_ALIASES = {
 SUPPORTED_RULE_ALGORITHMS = {
     "action_rules_cpu",
     "action_rules_gpu",
+    "action_rules_auto",
     "actionrules_sykora",
+}
+
+BITSET_MODES = ["cpu", "gpu"]
+
+BITSET_MODE_ALIASES = {
+    "autotune": "auto",
+}
+
+SUPPORTED_BITSET_MODES = {
+    "cpu",
+    "gpu",
+    "auto",
 }
 
 
@@ -171,6 +187,15 @@ def _parse_rule_algorithm_list(raw: str, default_values: list[str]) -> list[str]
         default_values=default_values,
         aliases=RULE_ALGORITHM_ALIASES,
         supported_values=SUPPORTED_RULE_ALGORITHMS,
+    )
+
+
+def _parse_bitset_mode_list(raw: str, default_values: list[str]) -> list[str]:
+    return _parse_canonical_list(
+        raw=raw,
+        default_values=default_values,
+        aliases=BITSET_MODE_ALIASES,
+        supported_values=SUPPORTED_BITSET_MODES,
     )
 
 
@@ -350,7 +375,7 @@ def _run_actionrules_sykora(
                         "rule_count": 0,
                         "elapsed_seconds": float(elapsed),
                         "max_gpu_mem_mb": None,
-                        "gpu_batch_size": None,
+                        "gpu_node_batch_size": None,
                         "min_support_count_effective": int(min_support_count),
                         "min_confidence_effective": float(min_confidence),
                     }
@@ -391,7 +416,7 @@ def _run_actionrules_sykora(
         "rule_count": int(rule_count),
         "elapsed_seconds": float(elapsed),
         "max_gpu_mem_mb": None,
-        "gpu_batch_size": None,
+        "gpu_node_batch_size": None,
         "min_support_count_effective": int(min_support_count),
         "min_confidence_effective": float(min_confidence),
     }
@@ -404,7 +429,11 @@ def _run_action_rules_algorithm(
     min_support_count: int,
     min_confidence: float,
     max_gpu_mem_mb: int | None,
-    gpu_batch_size: int | None,
+    gpu_node_batch_size: int | None,
+    autotune_sample_frac: float,
+    autotune_sample_min_rows: int,
+    autotune_sample_max_rows: int,
+    autotune_random_state: int,
 ) -> dict[str, Any]:
     if algorithm == "action_rules_cpu":
         result = run_profile(
@@ -412,7 +441,7 @@ def _run_action_rules_algorithm(
             dataset=preset_key,
             repeat_factor=1,
             max_gpu_mem_mb=max_gpu_mem_mb,
-            gpu_batch_size=gpu_batch_size,
+            gpu_node_batch_size=gpu_node_batch_size,
             min_support_count=min_support_count,
             min_confidence=min_confidence,
             verbose=False,
@@ -429,9 +458,31 @@ def _run_action_rules_algorithm(
             dataset=preset_key,
             repeat_factor=1,
             max_gpu_mem_mb=max_gpu_mem_mb,
-            gpu_batch_size=gpu_batch_size,
+            gpu_node_batch_size=gpu_node_batch_size,
             min_support_count=min_support_count,
             min_confidence=min_confidence,
+            verbose=False,
+        )
+        return {
+            "status": str(result.get("status", "ok")),
+            "note": str(result.get("note", "")),
+            **result,
+        }
+
+    if algorithm == "action_rules_auto":
+        result = run_profile(
+            use_gpu=False,
+            dataset=preset_key,
+            repeat_factor=1,
+            max_gpu_mem_mb=max_gpu_mem_mb,
+            gpu_node_batch_size=gpu_node_batch_size,
+            min_support_count=min_support_count,
+            min_confidence=min_confidence,
+            autotune=True,
+            autotune_sample_frac=autotune_sample_frac,
+            autotune_sample_min_rows=autotune_sample_min_rows,
+            autotune_sample_max_rows=autotune_sample_max_rows,
+            autotune_random_state=autotune_random_state,
             verbose=False,
         )
         return {
@@ -450,6 +501,52 @@ def _run_action_rules_algorithm(
     return {
         "status": "error",
         "note": f"Unsupported action-rules algorithm '{algorithm}'.",
+    }
+
+
+def _normalize_profile_result(
+    result: dict[str, Any],
+    *,
+    fallback_min_support_count: int | None = None,
+    fallback_min_confidence: float | None = None,
+) -> dict[str, Any]:
+    autotune = result.get("autotune")
+    autotune_summary = autotune if isinstance(autotune, dict) else {}
+
+    return {
+        "status": str(result.get("status", "error")),
+        "note": str(result.get("note", "")),
+        "mode": result.get("mode"),
+        "use_gpu": result.get("use_gpu"),
+        "requested_backend": result.get("requested_backend"),
+        "actual_backend": result.get("actual_backend"),
+        "gpu_acceleration_active": result.get("gpu_acceleration_active"),
+        "gpu_dataframe_active": result.get("gpu_dataframe_active"),
+        "dataset_path": result.get("dataset_path"),
+        "rows": result.get("rows"),
+        "rule_count": result.get("rule_count"),
+        "elapsed_seconds": result.get("elapsed_seconds"),
+        "max_gpu_mem_mb": result.get("max_gpu_mem_mb"),
+        "gpu_node_batch_size": result.get("gpu_node_batch_size"),
+        "min_support_count_effective": result.get(
+            "min_support_count_effective", fallback_min_support_count
+        ),
+        "min_confidence_effective": result.get(
+            "min_confidence_effective", fallback_min_confidence
+        ),
+        "autotune_enabled": bool(autotune_summary.get("enabled", False)),
+        "autotune_sample_rows": autotune_summary.get("sample_rows"),
+        "autotune_sample_support_count_effective": autotune_summary.get(
+            "sample_support_count_effective"
+        ),
+        "autotune_candidate_count": autotune_summary.get("candidate_count"),
+        "autotune_selected_use_gpu": autotune_summary.get("selected_use_gpu"),
+        "autotune_selected_gpu_node_batch_size": autotune_summary.get(
+            "selected_gpu_node_batch_size"
+        ),
+        "autotune_selected_actual_backend_on_sample": autotune_summary.get(
+            "selected_actual_backend_on_sample"
+        ),
     }
 
 
@@ -524,7 +621,11 @@ def _run_action_rules_suite(
     output_dir: Path,
     tag: str,
     max_gpu_mem_mb: int | None,
-    gpu_batch_size: int | None,
+    gpu_node_batch_size: int | None,
+    autotune_sample_frac: float,
+    autotune_sample_min_rows: int,
+    autotune_sample_max_rows: int,
+    autotune_random_state: int,
 ) -> dict:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     suffix = f"_{tag}" if tag else ""
@@ -562,7 +663,11 @@ def _run_action_rules_suite(
                     min_support_count=min_support_count,
                     min_confidence=min_confidence,
                     max_gpu_mem_mb=max_gpu_mem_mb,
-                    gpu_batch_size=gpu_batch_size,
+                    gpu_node_batch_size=gpu_node_batch_size,
+                    autotune_sample_frac=autotune_sample_frac,
+                    autotune_sample_min_rows=autotune_sample_min_rows,
+                    autotune_sample_max_rows=autotune_sample_max_rows,
+                    autotune_random_state=autotune_random_state,
                 )
 
             for run_index in range(max(1, int(runs))):
@@ -577,7 +682,11 @@ def _run_action_rules_suite(
                         min_support_count=min_support_count,
                         min_confidence=min_confidence,
                         max_gpu_mem_mb=max_gpu_mem_mb,
-                        gpu_batch_size=gpu_batch_size,
+                        gpu_node_batch_size=gpu_node_batch_size,
+                        autotune_sample_frac=autotune_sample_frac,
+                        autotune_sample_min_rows=autotune_sample_min_rows,
+                        autotune_sample_max_rows=autotune_sample_max_rows,
+                        autotune_random_state=autotune_random_state,
                     )
                 except Exception as exc:  # pragma: no cover - defensive fallback
                     result = {
@@ -585,28 +694,11 @@ def _run_action_rules_suite(
                         "note": f"{exc.__class__.__name__}: {exc}",
                     }
 
-                normalized = {
-                    "status": str(result.get("status", "error")),
-                    "note": str(result.get("note", "")),
-                    "mode": result.get("mode"),
-                    "use_gpu": result.get("use_gpu"),
-                    "requested_backend": result.get("requested_backend"),
-                    "actual_backend": result.get("actual_backend"),
-                    "gpu_acceleration_active": result.get("gpu_acceleration_active"),
-                    "gpu_dataframe_active": result.get("gpu_dataframe_active"),
-                    "dataset_path": result.get("dataset_path"),
-                    "rows": result.get("rows"),
-                    "rule_count": result.get("rule_count"),
-                    "elapsed_seconds": result.get("elapsed_seconds"),
-                    "max_gpu_mem_mb": result.get("max_gpu_mem_mb"),
-                    "gpu_batch_size": result.get("gpu_batch_size"),
-                    "min_support_count_effective": result.get(
-                        "min_support_count_effective", min_support_count
-                    ),
-                    "min_confidence_effective": result.get(
-                        "min_confidence_effective", min_confidence
-                    ),
-                }
+                normalized = _normalize_profile_result(
+                    result,
+                    fallback_min_support_count=min_support_count,
+                    fallback_min_confidence=min_confidence,
+                )
 
                 row = {
                     "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -655,12 +747,17 @@ def _run_action_rules_suite(
 def _run_bitset_cpu_gpu_suite(
     *,
     dataset_presets: list[str],
+    modes: list[str],
     runs: int,
     warmup_runs: int,
     output_dir: Path,
     tag: str,
     max_gpu_mem_mb: int | None,
-    gpu_batch_size: int | None,
+    gpu_node_batch_size: int | None,
+    autotune_sample_frac: float,
+    autotune_sample_min_rows: int,
+    autotune_sample_max_rows: int,
+    autotune_random_state: int,
 ) -> dict:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     suffix = f"_{tag}" if tag else ""
@@ -676,8 +773,9 @@ def _run_bitset_cpu_gpu_suite(
     rows: list[dict] = []
 
     for dataset in dataset_presets:
-        for mode in ("cpu", "gpu"):
+        for mode in modes:
             use_gpu = mode == "gpu"
+            autotune = mode == "auto"
             for warmup_index in range(max(0, int(warmup_runs))):
                 print(
                     f"bitset warmup dataset={dataset} mode={mode} "
@@ -688,7 +786,12 @@ def _run_bitset_cpu_gpu_suite(
                     dataset=dataset,
                     repeat_factor=1,
                     max_gpu_mem_mb=max_gpu_mem_mb,
-                    gpu_batch_size=gpu_batch_size,
+                    gpu_node_batch_size=gpu_node_batch_size,
+                    autotune=autotune,
+                    autotune_sample_frac=autotune_sample_frac,
+                    autotune_sample_min_rows=autotune_sample_min_rows,
+                    autotune_sample_max_rows=autotune_sample_max_rows,
+                    autotune_random_state=autotune_random_state,
                     verbose=False,
                 )
 
@@ -699,7 +802,12 @@ def _run_bitset_cpu_gpu_suite(
                     dataset=dataset,
                     repeat_factor=1,
                     max_gpu_mem_mb=max_gpu_mem_mb,
-                    gpu_batch_size=gpu_batch_size,
+                    gpu_node_batch_size=gpu_node_batch_size,
+                    autotune=autotune,
+                    autotune_sample_frac=autotune_sample_frac,
+                    autotune_sample_min_rows=autotune_sample_min_rows,
+                    autotune_sample_max_rows=autotune_sample_max_rows,
+                    autotune_random_state=autotune_random_state,
                     verbose=False,
                 )
                 row = {
@@ -708,7 +816,7 @@ def _run_bitset_cpu_gpu_suite(
                     "dataset_key": dataset,
                     "mode_key": mode,
                     "run_index": int(run_index),
-                    **result,
+                    **_normalize_profile_result(result),
                 }
                 rows.append(row)
                 _append_jsonl_row(jsonl_path, row)
@@ -754,6 +862,7 @@ def _run_bitset_cpu_gpu_suite(
 
     return {
         "suite": "bitset_cpu_vs_gpu",
+        "modes": list(modes),
         "runs": int(runs),
         "warmup_runs": int(warmup_runs),
         "output_paths": {
@@ -801,6 +910,15 @@ def main() -> None:
         help=(
             "Optional comma-separated algorithm override for action-rules suite. "
             f"Defaults to: {','.join(RULE_ALGORITHMS)}"
+        ),
+    )
+    parser.add_argument(
+        "--bitset-modes",
+        type=str,
+        default="",
+        help=(
+            "Optional comma-separated mode override for ActionRules bitset suite. "
+            f"Defaults to: {','.join(BITSET_MODES)}"
         ),
     )
     parser.add_argument("--runs-fim", type=int, default=3, help="Measured runs per dataset/algorithm for FIM suite.")
@@ -860,7 +978,43 @@ def main() -> None:
     )
     parser.add_argument("--spmf-timeout-sec", type=int, default=300, help="Timeout per SPMF invocation.")
     parser.add_argument("--max-gpu-mem-mb", type=int, default=None, help="Optional GPU memory cap for bitset suite.")
-    parser.add_argument("--gpu-batch-size", type=int, default=None, help="Optional GPU candidate batch size.")
+    parser.add_argument(
+        "--gpu-node-batch-size",
+        type=int,
+        default=None,
+        help="Optional number of BFS queue nodes grouped before one GPU expansion pass.",
+    )
+    parser.add_argument(
+        "--gpu-batch-size",
+        dest="gpu_node_batch_size",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--autotune-sample-frac",
+        type=float,
+        default=0.05,
+        help="Requested sample fraction used during autotuning.",
+    )
+    parser.add_argument(
+        "--autotune-sample-min-rows",
+        type=int,
+        default=5000,
+        help="Minimum sample size used during autotuning.",
+    )
+    parser.add_argument(
+        "--autotune-sample-max-rows",
+        type=int,
+        default=50000,
+        help="Maximum sample size used during autotuning.",
+    )
+    parser.add_argument(
+        "--autotune-random-state",
+        type=int,
+        default=42,
+        help="Random seed used during autotuning sampling.",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -939,20 +1093,30 @@ def main() -> None:
                 output_dir=args.output_dir,
                 tag=args.tag,
                 max_gpu_mem_mb=args.max_gpu_mem_mb,
-                gpu_batch_size=args.gpu_batch_size,
+                gpu_node_batch_size=args.gpu_node_batch_size,
+                autotune_sample_frac=float(args.autotune_sample_frac),
+                autotune_sample_min_rows=max(1, int(args.autotune_sample_min_rows)),
+                autotune_sample_max_rows=max(1, int(args.autotune_sample_max_rows)),
+                autotune_random_state=int(args.autotune_random_state),
             )
         )
 
     if not args.skip_bitset:
+        bitset_modes = _parse_bitset_mode_list(args.bitset_modes, BITSET_MODES)
         results.append(
             _run_bitset_cpu_gpu_suite(
                 dataset_presets=dataset_presets,
+                modes=bitset_modes,
                 runs=max(1, int(args.runs_bitset)),
                 warmup_runs=max(0, int(args.warmup_bitset)),
                 output_dir=args.output_dir,
                 tag=args.tag,
                 max_gpu_mem_mb=args.max_gpu_mem_mb,
-                gpu_batch_size=args.gpu_batch_size,
+                gpu_node_batch_size=args.gpu_node_batch_size,
+                autotune_sample_frac=float(args.autotune_sample_frac),
+                autotune_sample_min_rows=max(1, int(args.autotune_sample_min_rows)),
+                autotune_sample_max_rows=max(1, int(args.autotune_sample_max_rows)),
+                autotune_random_state=int(args.autotune_random_state),
             )
         )
 

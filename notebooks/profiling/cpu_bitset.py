@@ -21,10 +21,17 @@ def main() -> None:
         help="Accepted for CLI compatibility, ignored on CPU mode.",
     )
     parser.add_argument(
-        "--gpu-batch-size",
+        "--gpu-node-batch-size",
         type=int,
         default=None,
         help="Accepted for CLI compatibility, ignored on CPU mode.",
+    )
+    parser.add_argument(
+        "--gpu-batch-size",
+        dest="gpu_node_batch_size",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--save-metrics",
@@ -51,7 +58,7 @@ def main() -> None:
         dataset=args.dataset,
         repeat_factor=1,
         max_gpu_mem_mb=args.max_gpu_mem_mb,
-        gpu_batch_size=args.gpu_batch_size,
+        gpu_node_batch_size=args.gpu_node_batch_size,
         verbose=args.verbose,
     )
     if args.save_metrics:
