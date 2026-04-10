@@ -165,6 +165,46 @@ def test_one_hot_encode_empty_stable(action_rules):
     assert set(encoded_df.columns) == set(expected_columns)
 
 
+def test_one_hot_encode_ignores_missing_antecedents(action_rules):
+    """
+    Missing stable/flexible values should not become explicit one-hot categories.
+    """
+    df = pd.DataFrame(
+        {
+            'stable': ['a', np.nan],
+            'flexible': ['x', np.nan],
+            'target': ['yes', 'no'],
+        }
+    )
+    action_rules.set_array_library(use_gpu=False, df=df)
+
+    encoded_df = action_rules.one_hot_encode(df, ['stable'], ['flexible'], 'target')
+
+    assert 'stable_<item_stable>_a' in encoded_df.columns
+    assert 'flexible_<item_flexible>_x' in encoded_df.columns
+    assert 'stable_<item_stable>_nan' not in encoded_df.columns
+    assert 'flexible_<item_flexible>_nan' not in encoded_df.columns
+
+
+def test_one_hot_encode_keeps_target_missing_as_category(action_rules):
+    """
+    Target NaNs remain explicit categories to preserve downstream target-state handling.
+    """
+    df = pd.DataFrame(
+        {
+            'stable': ['a', 'b'],
+            'flexible': ['x', 'y'],
+            'target': ['yes', np.nan],
+        }
+    )
+    action_rules.set_array_library(use_gpu=False, df=df)
+
+    encoded_df = action_rules.one_hot_encode(df, ['stable'], ['flexible'], 'target')
+
+    assert 'target_<item_target>_yes' in encoded_df.columns
+    assert 'target_<item_target>_nan' in encoded_df.columns
+
+
 def test_build_bit_masks_single_word(action_rules):
     """
     Verify that a small binary matrix is packed into a single 64-bit word per attribute.
@@ -427,17 +467,29 @@ def test_fit_uses_bfs_candidate_expansion(action_rules, monkeypatch):
             return None
 
         def generate_candidates(self, **candidate):
+            child_candidate = {
+                key: value
+                for key, value in candidate.items()
+                if key
+                in {
+                    'stable_items_binding',
+                    'flexible_items_binding',
+                    'undesired_mask_bitset',
+                    'desired_mask_bitset',
+                    'actionable_attributes',
+                }
+            }
             prefix = tuple(candidate['ar_prefix'])
             visited_prefixes.append(prefix)
             if prefix == tuple():
                 return [
                     {
-                        **candidate,
+                        **child_candidate,
                         'ar_prefix': ('a',),
                         'itemset_prefix': ('a',),
                     },
                     {
-                        **candidate,
+                        **child_candidate,
                         'ar_prefix': ('b',),
                         'itemset_prefix': ('b',),
                     },
@@ -445,7 +497,7 @@ def test_fit_uses_bfs_candidate_expansion(action_rules, monkeypatch):
             if prefix == ('a',):
                 return [
                     {
-                        **candidate,
+                        **child_candidate,
                         'ar_prefix': ('a', 'a1'),
                         'itemset_prefix': ('a', 'a1'),
                     }
