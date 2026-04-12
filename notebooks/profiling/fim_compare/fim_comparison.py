@@ -1,4 +1,4 @@
-"""Compare local bitset FIM (CPU/GPU) against Python and external baselines.
+"""Compare local bitset itemset mining (CPU/GPU) against Python and external baselines.
 
 This module provides:
 - `run_benchmark(...)` for programmatic use (e.g., in notebooks),
@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import importlib
 import json
-from itertools import combinations
 from pathlib import Path
 import subprocess
 import tempfile
@@ -28,9 +27,9 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TELCO_PATH = REPO_ROOT / "notebooks" / "data" / "telco.csv"
 DEFAULT_DATASET_PATHS = [
-    REPO_ROOT / "notebooks" / "data" / "bank-full.csv",
-    REPO_ROOT / "notebooks" / "data" / "german.csv",
-    REPO_ROOT / "notebooks" / "data" / "covtype.csv",
+    REPO_ROOT / "notebooks" / "data" / "telco.csv",
+    REPO_ROOT / "notebooks" / "data" / "adult.csv",
+    REPO_ROOT / "notebooks" / "data" / "census_income.csv",
 ]
 
 # Default Telco columns used for transaction representation.
@@ -387,16 +386,15 @@ def _pack_bool_rows_to_uint64(bool_rows: np.ndarray) -> np.ndarray:
     return packed.view(np.uint64)
 
 
-def _mine_itemsets_and_rules(
+def _mine_itemsets(
     *,
     l1_supports: Sequence[int],
     min_support_count: int,
-    min_confidence: float,
     max_len: int,
     support_fn: Callable[[tuple[int, ...]], int] | None = None,
     batch_support_fn: Callable[[list[tuple[int, ...]]], list[int]] | None = None,
     finalize_timing_hook: Callable[[], None] | None = None,
-) -> tuple[int, int, float]:
+) -> tuple[int, float]:
     if support_fn is None and batch_support_fn is None:
         raise ValueError("Either support_fn or batch_support_fn must be provided.")
 
@@ -471,25 +469,11 @@ def _mine_itemsets_and_rules(
 
         frequent_prev = frequent_next
 
-    # Generate association rules from frequent itemsets.
-    rule_count = 0
-    for itemset, supp_itemset in support_map.items():
-        if len(itemset) < 2:
-            continue
-        for r in range(1, len(itemset)):
-            for antecedent in combinations(itemset, r):
-                antecedent_supp = support_map.get(antecedent)
-                if not antecedent_supp:
-                    continue
-                confidence = float(supp_itemset) / float(antecedent_supp)
-                if confidence >= min_confidence:
-                    rule_count += 1
-
     if finalize_timing_hook is not None:
         finalize_timing_hook()
     elapsed = perf_counter() - started
     itemset_count = len(support_map)
-    return rule_count, itemset_count, elapsed
+    return itemset_count, elapsed
 
 
 @dataclass
@@ -525,16 +509,14 @@ class BitsetFIMCPU:
     def _supports_for_itemsets(self, itemsets: list[tuple[int, ...]]) -> list[int]:
         return _supports_for_candidates_cpu(self.bit_masks, itemsets)
 
-    def mine_association_rules(
+    def mine_itemsets(
         self,
         min_support_count: int,
-        min_confidence: float,
         max_len: int,
-    ) -> tuple[int, int, float]:
-        return _mine_itemsets_and_rules(
+    ) -> tuple[int, float]:
+        return _mine_itemsets(
             l1_supports=self.l1_supports,
             min_support_count=min_support_count,
-            min_confidence=min_confidence,
             max_len=max_len,
             batch_support_fn=self._supports_for_itemsets,
         )
@@ -580,16 +562,14 @@ class BitsetFIMGPU:
     def _supports_for_itemsets(self, itemsets: list[tuple[int, ...]]) -> list[int]:
         return _supports_for_candidates_gpu(self.bit_masks, itemsets)
 
-    def mine_association_rules(
+    def mine_itemsets(
         self,
         min_support_count: int,
-        min_confidence: float,
         max_len: int,
-    ) -> tuple[int, int, float]:
-        return _mine_itemsets_and_rules(
+    ) -> tuple[int, float]:
+        return _mine_itemsets(
             l1_supports=self.l1_supports,
             min_support_count=min_support_count,
-            min_confidence=min_confidence,
             max_len=max_len,
             batch_support_fn=self._supports_for_itemsets,
             finalize_timing_hook=_sync_cupy_default_stream,
@@ -602,18 +582,28 @@ def _run_bitset_fim_cpu(
     min_confidence: float,
     max_len: int,
 ) -> dict:
-    rule_count, itemset_count, elapsed = model.mine_association_rules(
+    itemset_count, elapsed = model.mine_itemsets(
         min_support_count=min_support_count,
-        min_confidence=min_confidence,
         max_len=max_len,
     )
     return {
         "status": "ok",
         "elapsed_seconds": float(elapsed),
-        "rule_count": int(rule_count),
+        "rule_count": None,
         "itemset_count": int(itemset_count),
-        "note": "",
+        "note": "itemsets_only=true",
     }
+
+
+def _classify_bitset_gpu_error(model_error: str | None) -> str:
+    if not model_error:
+        return "error"
+    error_lower = model_error.lower()
+    if "outofmemory" in error_lower or "out of memory" in error_lower:
+        return "oom"
+    if "cupy is not available" in error_lower or "no module named 'cupy'" in error_lower:
+        return "missing_dependency"
+    return "error"
 
 
 def _run_bitset_fim_gpu(
@@ -625,7 +615,7 @@ def _run_bitset_fim_gpu(
 ) -> dict:
     if model is None:
         return {
-            "status": "missing_dependency",
+            "status": _classify_bitset_gpu_error(model_error),
             "elapsed_seconds": None,
             "rule_count": None,
             "itemset_count": None,
@@ -633,14 +623,13 @@ def _run_bitset_fim_gpu(
         }
 
     try:
-        rule_count, itemset_count, elapsed = model.mine_association_rules(
+        itemset_count, elapsed = model.mine_itemsets(
             min_support_count=min_support_count,
-            min_confidence=min_confidence,
             max_len=max_len,
         )
     except Exception as exc:
         return {
-            "status": "error",
+            "status": _classify_bitset_gpu_error(f"{type(exc).__name__}: {exc}"),
             "elapsed_seconds": None,
             "rule_count": None,
             "itemset_count": None,
@@ -650,9 +639,9 @@ def _run_bitset_fim_gpu(
     return {
         "status": "ok",
         "elapsed_seconds": float(elapsed),
-        "rule_count": int(rule_count),
+        "rule_count": None,
         "itemset_count": int(itemset_count),
-        "note": "",
+        "note": "itemsets_only=true",
     }
 
 
@@ -677,31 +666,26 @@ def _run_apyori(
     min_support_ratio = _min_support_ratio(min_support_count, len(transactions))
     started = perf_counter()
     itemset_count = 0
-    rule_count = 0
     truncated = False
     for relation_record in apyori.apriori(
         transactions,
         min_support=min_support_ratio,
-        min_confidence=min_confidence,
-        min_lift=1.0,
+        min_confidence=0.0,
+        min_lift=0.0,
         max_length=max_len,
     ):
         itemset_count += 1
-        for stat in relation_record.ordered_statistics:
-            if stat.items_base and stat.items_add:
-                if len(stat.items_base) + len(stat.items_add) <= max_len:
-                    rule_count += 1
         if itemset_count >= max_records:
             truncated = True
             break
     elapsed = perf_counter() - started
-    note = f"min_support_ratio={min_support_ratio:.10f}"
+    note = f"min_support_ratio={min_support_ratio:.10f};itemsets_only=true"
     if truncated:
         note += ";truncated=true"
     return {
         "status": "ok",
         "elapsed_seconds": float(elapsed),
-        "rule_count": int(rule_count),
+        "rule_count": None,
         "itemset_count": int(itemset_count),
         "note": note,
     }
@@ -751,7 +735,7 @@ def _run_pyfim_itemsets(
                 "elapsed_seconds": float(elapsed),
                 "rule_count": None,
                 "itemset_count": int(len(output)),
-                "note": f"method={method_name};kwargs={kwargs}",
+                "note": f"method={method_name};kwargs={kwargs};itemsets_only=true",
             }
         except TypeError as exc:
             last_error = exc
@@ -793,14 +777,13 @@ def _run_mlxtend_itemsets(
         }
 
     miner = getattr(fp, method_name, None)
-    assoc_rules = getattr(fp, "association_rules", None)
-    if miner is None or assoc_rules is None:
+    if miner is None:
         return {
             "status": "error",
             "elapsed_seconds": None,
             "rule_count": None,
             "itemset_count": None,
-            "note": f"mlxtend.frequent_patterns missing '{method_name}' or 'association_rules'",
+            "note": f"mlxtend.frequent_patterns missing '{method_name}'",
         }
 
     min_support_ratio = _min_support_ratio(min_support_count, len(onehot))
@@ -822,23 +805,13 @@ def _run_mlxtend_itemsets(
         }
 
     itemset_count = int(len(itemsets))
-    rule_count = 0
-    if itemset_count > 0:
-        try:
-            rules = assoc_rules(itemsets, metric="confidence", min_threshold=min_confidence)
-            if len(rules) > 0:
-                rule_sizes = rules["antecedents"].map(len) + rules["consequents"].map(len)
-                rules = rules[rule_sizes <= max_len]
-            rule_count = int(len(rules))
-        except Exception:
-            rule_count = 0
     elapsed = perf_counter() - started
     return {
         "status": "ok",
         "elapsed_seconds": float(elapsed),
-        "rule_count": int(rule_count),
+        "rule_count": None,
         "itemset_count": itemset_count,
-        "note": f"method={method_name};min_support_ratio={min_support_ratio:.10f}",
+        "note": f"method={method_name};min_support_ratio={min_support_ratio:.10f};itemsets_only=true",
     }
 
 
@@ -963,7 +936,7 @@ def _run_spmf_itemsets(
         "elapsed_seconds": float(elapsed),
         "rule_count": None,
         "itemset_count": int(itemset_count),
-        "note": f"algorithm={spmf_algorithm};min_support={min_support_arg}",
+        "note": f"algorithm={spmf_algorithm};min_support={min_support_arg};itemsets_only=true",
     }
 
 
@@ -1058,7 +1031,7 @@ def _run_cpp_fim(
         "elapsed_seconds": float(elapsed),
         "rule_count": None,
         "itemset_count": int(itemset_count),
-        "note": "external_cpp_command",
+        "note": "external_cpp_command;itemsets_only=true",
     }
 
 
@@ -1334,7 +1307,18 @@ def run_benchmark(
                     for warmup_index in range(warmup_count):
                         print(f"dataset={current_dataset_path} warmup={warmup_index + 1}/{warmup_count}")
                         for algo in algorithms:
-                            _run_algorithm(algo=algo, run_index=-(warmup_index + 1))
+                            print(
+                                "dataset="
+                                f"{current_dataset_path} warmup={warmup_index + 1}/{warmup_count} "
+                                f"algorithm={algo} start"
+                            )
+                            warmup_result = _run_algorithm(algo=algo, run_index=-(warmup_index + 1))
+                            print(
+                                "dataset="
+                                f"{current_dataset_path} warmup={warmup_index + 1}/{warmup_count} "
+                                f"algorithm={algo} status={warmup_result.get('status')} "
+                                f"elapsed_seconds={warmup_result.get('elapsed_seconds')}"
+                            )
                     _sync_cupy_default_stream()
 
                 for run_index in range(run_count):
@@ -1342,7 +1326,15 @@ def run_benchmark(
                     print(f"dataset={current_dataset_path} run={run_no}/{run_count}")
 
                     for algo in algorithms:
+                        print(
+                            f"dataset={current_dataset_path} run={run_no}/{run_count} algorithm={algo} start"
+                        )
                         result = _run_algorithm(algo=algo, run_index=run_index)
+                        print(
+                            "dataset="
+                            f"{current_dataset_path} run={run_no}/{run_count} algorithm={algo} "
+                            f"status={result.get('status')} elapsed_seconds={result.get('elapsed_seconds')}"
+                        )
                         row = {
                             "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                             "algorithm": algo,
@@ -1389,7 +1381,7 @@ def run_benchmark(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark bitset FIM (CPU/GPU) against Python/Java/C++ baselines."
+        description="Benchmark itemset mining baselines (CPU/GPU/Python/Java/C++)."
     )
     parser.add_argument(
         "--repeat-factors",
@@ -1487,7 +1479,7 @@ def main() -> None:
         "--dataset-paths",
         type=str,
         default="",
-        help="Comma-separated dataset paths. If omitted, defaults to bank/german/covtype when available.",
+        help="Comma-separated dataset paths. If omitted, defaults to telco/adult/census_income when available.",
     )
     parser.add_argument(
         "--dataset-sep",

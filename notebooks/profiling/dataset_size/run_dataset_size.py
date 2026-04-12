@@ -72,8 +72,8 @@ def main() -> None:
     parser.add_argument(
         "--datasets",
         type=str,
-        default="bank,german,covtype,adult,census_income",
-        help="Comma-separated dataset presets (e.g. bank,german,covtype,adult,census_income,telco).",
+        default="telco,adult,census_income",
+        help="Comma-separated dataset presets (e.g. telco,adult,census_income).",
     )
     parser.add_argument(
         "--runs",

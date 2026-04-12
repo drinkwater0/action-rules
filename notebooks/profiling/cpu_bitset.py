@@ -11,8 +11,8 @@ def main() -> None:
     parser.add_argument(
         "--dataset",
         type=str,
-        default="bank",
-        help="Dataset preset: bank,german,covtype,telco",
+        default="telco",
+        help="Dataset preset: telco,adult,census_income",
     )
     parser.add_argument(
         "--max-gpu-mem-mb",

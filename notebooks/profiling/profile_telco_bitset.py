@@ -221,7 +221,7 @@ def profile_dataset_frame(data_frame, preset, top_k: int = 8) -> dict:
     }
 
 
-def profile_dataset(dataset: str = "bank", top_k: int = 8) -> dict:
+def profile_dataset(dataset: str = "telco", top_k: int = 8) -> dict:
     preset, data_frame = _load_preset_and_frame(dataset)
     return profile_dataset_frame(data_frame, preset, top_k=top_k)
 
@@ -547,7 +547,7 @@ def _autotune_run_profile(
 
 def run_profile(
     use_gpu: bool,
-    dataset: str = "bank",
+    dataset: str = "telco",
     repeat_factor: int = 1,
     max_gpu_mem_mb: Optional[int] = None,
     gpu_node_batch_size: Optional[int] = None,
@@ -565,7 +565,7 @@ def run_profile(
     if int(repeat_factor) != 1:
         raise ValueError(
             "Synthetic dataset multiplication is disabled. "
-            "Use real datasets (bank/german/covtype/adult/census_income/telco) without --repeat-factor > 1."
+            "Use real datasets (telco/adult/census_income) without --repeat-factor > 1."
         )
 
     if gpu_node_batch_size is None:
@@ -648,8 +648,8 @@ def main() -> None:
     parser.add_argument(
         "--dataset",
         type=str,
-        default="bank",
-        help="Dataset preset: bank,german,covtype,adult,census_income,telco",
+        default="telco",
+        help="Dataset preset: telco,adult,census_income",
     )
     parser.add_argument(
         "--repeat-factor",

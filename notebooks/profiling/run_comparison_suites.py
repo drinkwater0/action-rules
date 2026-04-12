@@ -32,6 +32,9 @@ if str(FIM_COMPARE_DIR) not in sys.path:
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
+# Defaults stay aligned across FIM and action-rules suites.
+DEFAULT_DATASET_PRESETS = ["telco", "adult", "census_income"]
+
 from fim_comparison import (  # noqa: E402
     ALGORITHM_ALIASES,
     SUPPORTED_ALGORITHMS,
@@ -41,15 +44,7 @@ from fim_comparison import (  # noqa: E402
 from profile_telco_bitset import DATASET_PRESETS, list_dataset_presets, run_profile  # noqa: E402
 
 
-DEFAULT_DATASET_PATHS = [
-    REPO_ROOT / "notebooks" / "data" / "bank-full.csv",
-    REPO_ROOT / "notebooks" / "data" / "german.csv",
-    REPO_ROOT / "notebooks" / "data" / "covtype.csv",
-]
-
-# Defaults for action-rule suites favor datasets that currently produce
-# non-zero rule sets with the repository thresholds.
-DEFAULT_DATASET_PRESETS = ["telco", "adult", "census_income"]
+DEFAULT_DATASET_PATHS = [DATASET_PRESETS[key].path.resolve() for key in DEFAULT_DATASET_PRESETS]
 
 FIM_ALGORITHMS = [
     "bitset_fim_cpu",
