@@ -6,7 +6,8 @@ from pathlib import Path
 import pandas as pd
 
 from notebooks.profiling.benchmark_datasets import DatasetPreset
-from notebooks.profiling import profile_telco_bitset as profile_module
+from notebooks.profiling import benchmark_runner as profile_module
+import action_rules.autotuning as autotuning_module
 
 
 def test_run_profile_marks_gpu_fallback(monkeypatch):
@@ -249,10 +250,31 @@ def test_run_profile_autotune_selects_fastest_config(monkeypatch):
             "min_confidence_effective": effective_confidence,
         }
 
+    # Fake autotune result: pretend GPU with batch_size=128 was fastest.
+    def fake_autotune(**kwargs):
+        return {
+            "use_gpu": True,
+            "gpu_node_batch_size": 128,
+            "sample_rows": 20,
+            "sample_support_count_effective": 2,
+            "candidate_count": 5,
+            "trials": [
+                {"candidate_use_gpu": False, "candidate_gpu_node_batch_size": None,
+                 "actual_backend": "cpu", "elapsed_seconds": 9.0, "rule_count": 7},
+                {"candidate_use_gpu": True, "candidate_gpu_node_batch_size": 32,
+                 "actual_backend": "gpu", "elapsed_seconds": 3.0, "rule_count": 7},
+                {"candidate_use_gpu": True, "candidate_gpu_node_batch_size": 64,
+                 "actual_backend": "gpu", "elapsed_seconds": 2.0, "rule_count": 7},
+                {"candidate_use_gpu": True, "candidate_gpu_node_batch_size": 128,
+                 "actual_backend": "gpu", "elapsed_seconds": 1.5, "rule_count": 7},
+                {"candidate_use_gpu": True, "candidate_gpu_node_batch_size": 256,
+                 "actual_backend": "gpu", "elapsed_seconds": 3.0, "rule_count": 7},
+            ],
+        }
+
     monkeypatch.setattr(profile_module, "load_frame", lambda path, sep: dummy_frame)
     monkeypatch.setattr(profile_module, "normalize_dataset_key", lambda dataset: "dummy")
     monkeypatch.setattr(profile_module, "DATASET_PRESETS", {"dummy": dummy_preset})
-    monkeypatch.setattr(profile_module, "_is_cupy_available", lambda: True)
     monkeypatch.setattr(
         profile_module,
         "profile_dataset_frame",
@@ -264,6 +286,7 @@ def test_run_profile_autotune_selects_fastest_config(monkeypatch):
             "density_hint": "dense_like",
         },
     )
+    monkeypatch.setattr(profile_module, "_autotune_core", fake_autotune)
     monkeypatch.setattr(profile_module, "_fit_profile_once", fake_fit_profile_once)
 
     result = profile_module.run_profile(
