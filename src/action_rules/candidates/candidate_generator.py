@@ -60,7 +60,6 @@ class CandidateGenerator:
     in_stop_list(ar_prefix, stop_list)
         Check if the action rule prefix is in the stop list.
     """
-    _gpu_support_kernel = None
     _gpu_support_kernel_multi = None
     _gpu_kernel_min_work = 512
     _gpu_batch_budget_mb = None
@@ -849,30 +848,11 @@ class CandidateGenerator:
         """
         if self.bit_masks is None or not items:
             return []
-        working_mask = mask_bitset
-        if (
-            hasattr(self.bit_masks, "__cuda_array_interface__")
-            and not hasattr(mask_bitset, "__cuda_array_interface__")
-        ):
-            try:
-                import cupy as cp
-
-                working_mask = cp.asarray(mask_bitset, dtype=cp.uint64)
-            except Exception:
-                working_mask = mask_bitset
-
-        use_gpu_kernel = False
-        if hasattr(working_mask, "__cuda_array_interface__"):
-            use_gpu_kernel = self._should_use_gpu_kernel(working_mask, len(items))
-        if use_gpu_kernel:
-            gpu_counts = self._gpu_bitset_support_batch(working_mask, items)
-            if gpu_counts is not None:
-                return gpu_counts
         indexer = self._contiguous_indexer(items)
         if indexer is None:
-            intersections = self.bit_masks[items] & working_mask
+            intersections = self.bit_masks[items] & mask_bitset
         else:
-            intersections = self.bit_masks[indexer] & working_mask
+            intersections = self.bit_masks[indexer] & mask_bitset
         return self._popcount_rows(intersections)
 
     @classmethod
@@ -921,59 +901,6 @@ class CandidateGenerator:
         if chunk_items < 1:
             return 1
         return min(requested_items, int(chunk_items))
-
-    @classmethod
-    def _get_gpu_support_kernel(cls):
-        """
-        Lazily compile and cache a CUDA kernel for batched AND + popcount support.
-        """
-        if cls._gpu_support_kernel is not None:
-            return cls._gpu_support_kernel
-
-        try:
-            import cupy as cp
-        except ImportError:
-            return None
-
-        kernel_code = r"""
-        extern "C" __global__
-        void bitset_support_kernel(
-            const unsigned long long* item_masks,
-            const unsigned long long* branch_mask,
-            int num_words,
-            unsigned long long* out_support
-        ) {
-            extern __shared__ unsigned int shared_counts[];
-            const int item_index = blockIdx.x;
-            const int thread_id = threadIdx.x;
-            unsigned int local_count = 0u;
-
-            const unsigned long long* row_ptr = item_masks + ((size_t)item_index * (size_t)num_words);
-            for (int word_index = thread_id; word_index < num_words; word_index += blockDim.x) {
-                local_count += (unsigned int)__popcll(row_ptr[word_index] & branch_mask[word_index]);
-            }
-
-            shared_counts[thread_id] = local_count;
-            __syncthreads();
-
-            for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-                if (thread_id < stride) {
-                    shared_counts[thread_id] += shared_counts[thread_id + stride];
-                }
-                __syncthreads();
-            }
-
-            if (thread_id == 0) {
-                out_support[item_index] = (unsigned long long)shared_counts[0];
-            }
-        }
-        """
-
-        try:
-            cls._gpu_support_kernel = cp.RawKernel(kernel_code, "bitset_support_kernel")
-        except Exception:
-            cls._gpu_support_kernel = None
-        return cls._gpu_support_kernel
 
     @classmethod
     def _get_gpu_support_kernel_multi(cls):
@@ -1152,88 +1079,6 @@ class CandidateGenerator:
                 supports_host_b[start:stop] = cp.asnumpy(supports_b).astype(np.int64, copy=False)
 
             return supports_host_a.tolist(), supports_host_b.tolist()
-        except Exception:
-            return None
-
-    def _gpu_bitset_support_batch(
-        self, mask_bitset: Union['numpy.ndarray', 'cupy.ndarray'], items: list
-    ) -> Optional[list[int]]:
-        """
-        Compute batched support on GPU via a custom CUDA kernel when available.
-        The item dimension is chunked to keep temporary allocations under a memory budget.
-        """
-        if self.bit_masks is None or not items:
-            return []
-
-        try:
-            import cupy as cp
-        except ImportError:
-            return None
-
-        kernel = self._get_gpu_support_kernel()
-        if kernel is None:
-            return None
-
-        try:
-            branch_mask = cp.asarray(mask_bitset, dtype=cp.uint64).reshape(-1)
-            branch_mask = cp.ascontiguousarray(branch_mask)
-            num_words = int(branch_mask.size)
-            total_items = len(items)
-            threads_per_block = 256
-            shared_mem_bytes = threads_per_block * cp.dtype(cp.uint32).itemsize
-            import numpy as np
-
-            budget_bytes = (
-                int(self._gpu_batch_budget_mb * 1024 * 1024)
-                if self._gpu_batch_budget_mb is not None
-                else None
-            )
-            try:
-                free_bytes, _ = cp.cuda.runtime.memGetInfo()
-                free_mem_budget = int(free_bytes * self._gpu_batch_free_mem_fraction)
-                if free_mem_budget > 0:
-                    budget_bytes = (
-                        free_mem_budget if budget_bytes is None else min(budget_bytes, free_mem_budget)
-                    )
-            except Exception:
-                pass
-
-            if budget_bytes is None:
-                per_item_bytes = (num_words * cp.dtype(cp.uint64).itemsize * 3) + cp.dtype(cp.uint64).itemsize
-                budget_bytes = per_item_bytes * total_items
-
-            chunk_items = self._compute_gpu_chunk_items(
-                num_words=num_words,
-                requested_items=total_items,
-                budget_bytes=int(budget_bytes),
-                word_bytes=cp.dtype(cp.uint64).itemsize,
-            )
-
-            supports_host = np.empty(total_items, dtype=np.int64)
-            contiguous_indexer = self._contiguous_indexer(items)
-            for start in range(0, total_items, chunk_items):
-                stop = min(total_items, start + chunk_items)
-                if contiguous_indexer is not None:
-                    value_start = items[start]
-                    value_stop = items[stop - 1] + 1
-                    indexer = slice(value_start, value_stop)
-                else:
-                    indexer = items[start:stop]
-                item_masks = cp.asarray(self.bit_masks[indexer], dtype=cp.uint64)
-                if item_masks.ndim == 1:
-                    item_masks = item_masks.reshape(1, -1)
-                item_masks = cp.ascontiguousarray(item_masks)
-
-                supports = cp.zeros(stop - start, dtype=cp.uint64)
-                kernel(
-                    (stop - start,),
-                    (threads_per_block,),
-                    (item_masks, branch_mask, int(num_words), supports),
-                    shared_mem=shared_mem_bytes,
-                )
-                supports_host[start:stop] = cp.asnumpy(supports).astype(np.int64, copy=False)
-
-            return supports_host.tolist()
         except Exception:
             return None
 
