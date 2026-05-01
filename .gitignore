@@ -123,6 +123,7 @@ notebooks/profiling/dataset_size/data/*.jsonl
 # Local benchmarking artifacts
 .tmp_pkg_inspect/
 notebooks/profiling/comparison_suites/
+notebooks/profiling/commit_benchmarks/
 notebooks/profiling/*_bitset/scalene_report_*.json
 notebooks/profiling/*_bitset/scalene_report_*.html
 
@@ -132,3 +133,7 @@ notebooks/data/bank-full.csv
 notebooks/data/census_income.csv
 notebooks/data/covtype.csv
 notebooks/data/german.csv
+
+# Local thesis drafts
+docs/bachelor_thesis_draft_v1.tex
+Thesis/
