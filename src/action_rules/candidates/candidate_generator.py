@@ -160,6 +160,8 @@ class CandidateGenerator:
         undesired_state: int,
         desired_state: int,
         verbose: bool = False,
+        parent_undesired_mask: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
+        parent_desired_mask: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
     ) -> list:
         """
         Generate candidate action rules.
@@ -208,6 +210,8 @@ class CandidateGenerator:
             itemset_prefix,
             undesired_state,
             desired_state,
+            parent_undesired_mask=parent_undesired_mask,
+            parent_desired_mask=parent_desired_mask,
         )
         if bitset_undesired_mask is None or bitset_desired_mask is None:
             return []
@@ -320,6 +324,8 @@ class CandidateGenerator:
             candidate.get("itemset_prefix", tuple()),
             undesired_state,
             desired_state,
+            parent_undesired_mask=candidate.get("parent_undesired_mask"),
+            parent_desired_mask=candidate.get("parent_desired_mask"),
         )
         if bitset_undesired_mask is None or bitset_desired_mask is None:
             return None
@@ -485,6 +491,8 @@ class CandidateGenerator:
                                 "itemset_prefix": new_ar_prefix,
                                 "item": item,
                                 "actionable_attributes": 0,
+                                "parent_undesired_mask": context["bitset_undesired_mask"],
+                                "parent_desired_mask": context["bitset_desired_mask"],
                             }
                         )
 
@@ -550,6 +558,8 @@ class CandidateGenerator:
                                 "itemset_prefix": context["itemset_prefix"] + (item,),
                                 "item": item,
                                 "actionable_attributes": context["actionable_attributes"] + 1,
+                                "parent_undesired_mask": context["bitset_undesired_mask"],
+                                "parent_desired_mask": context["bitset_desired_mask"],
                             }
                         )
                     if context["actionable_attributes"] + 1 >= self.min_flexible_attributes:
@@ -598,6 +608,8 @@ class CandidateGenerator:
         itemset_prefix: tuple,
         undesired_state: int,
         desired_state: int,
+        parent_undesired_mask: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
+        parent_desired_mask: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
     ) -> tuple:
         if self.bit_masks is None or not self.frames_bit_masks:
             return None, None
@@ -605,6 +617,20 @@ class CandidateGenerator:
         base_desired = self.frames_bit_masks.get(desired_state)
         if base_undesired is None or base_desired is None:
             return None, None
+
+        # Fast path: extend parent masks by the last item only (one AND per side).
+        # Parent masks are passed as references on child candidates, so the BFS pays
+        # O(1) launches per prefix extension instead of O(len(prefix)).
+        if (
+            parent_undesired_mask is not None
+            and parent_desired_mask is not None
+            and itemset_prefix
+        ):
+            last_item_row = self.bit_masks[itemset_prefix[-1]]
+            return (
+                parent_undesired_mask & last_item_row,
+                parent_desired_mask & last_item_row,
+            )
 
         bitset_undesired_mask = base_undesired
         bitset_desired_mask = base_desired
@@ -743,6 +769,8 @@ class CandidateGenerator:
                             'itemset_prefix': new_ar_prefix,
                             'item': item,
                             'actionable_attributes': 0,
+                            'parent_undesired_mask': undesired_mask_bitset,
+                            'parent_desired_mask': desired_mask_bitset,
                         }
                     )
 
@@ -1304,6 +1332,8 @@ class CandidateGenerator:
                             'itemset_prefix': itemset_prefix + (item,),
                             'item': item,
                             'actionable_attributes': actionable_attributes + 1,
+                            'parent_undesired_mask': undesired_mask_bitset,
+                            'parent_desired_mask': desired_mask_bitset,
                         }
                     )
                 if actionable_attributes + 1 >= self.min_flexible_attributes:
