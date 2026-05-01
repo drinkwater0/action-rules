@@ -474,8 +474,6 @@ def test_fit_uses_bfs_candidate_expansion(action_rules, monkeypatch):
                 in {
                     'stable_items_binding',
                     'flexible_items_binding',
-                    'undesired_mask_bitset',
-                    'desired_mask_bitset',
                     'actionable_attributes',
                 }
             }

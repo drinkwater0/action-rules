@@ -64,6 +64,20 @@ class CandidateGenerator:
     _gpu_kernel_min_work = 512
     _gpu_batch_budget_mb = None
     _gpu_batch_free_mem_fraction = 0.5
+    _gpu_bytes_per_word = 8
+    # Per worklist entry the kernel consumes:
+    #   supports_a (uint64) + supports_b (uint64)        = 16 bytes
+    #   candidate_indices (int32) + item_indices (int64) = 12 bytes
+    # 28 bytes rounded up to 32 to cover dtype padding and minor allocator overhead.
+    _gpu_support_bytes_per_item = 32
+    # Pad against allocations not modelled per-context or per-item: kernel module
+    # state, CuPy pool fragmentation, scratch buffers around stack/asarray. 1 MB is
+    # a generous empirical floor; on typical budgets (hundreds of MB+) this is a
+    # rounding error.
+    _gpu_batch_fixed_overhead_bytes = 1 * 1024 * 1024
+    # Reserve 10% of the resolved budget as headroom for transient allocations the
+    # model does not see (e.g. NVRTC caches, asynchronous CuPy housekeeping).
+    _gpu_batch_safety_factor = 0.9
 
     def __init__(
         self,
@@ -80,7 +94,6 @@ class CandidateGenerator:
         bit_masks: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
         gpu_batch_budget_mb: Optional[int] = None,
         gpu_batch_free_mem_fraction: float = 0.5,
-        spill_gpu_masks_to_cpu: bool = False,
     ):
         """
         Initialize the CandidateGenerator class with the specified parameters.
@@ -114,9 +127,6 @@ class CandidateGenerator:
             If None, chunking budget is derived from currently free GPU memory.
         gpu_batch_free_mem_fraction : float, optional
             Fraction of free GPU memory considered usable for one support batch.
-        spill_gpu_masks_to_cpu : bool, optional
-            If True, branch masks are moved to CPU after GPU intersections to
-            avoid queue growth in GPU memory under strict memory caps.
 
         Notes
         -----
@@ -137,7 +147,6 @@ class CandidateGenerator:
         self.rules = rules
         self._gpu_batch_budget_mb = gpu_batch_budget_mb
         self._gpu_batch_free_mem_fraction = gpu_batch_free_mem_fraction
-        self._spill_gpu_masks_to_cpu = spill_gpu_masks_to_cpu
 
     def generate_candidates(
         self,
@@ -151,10 +160,6 @@ class CandidateGenerator:
         undesired_state: int,
         desired_state: int,
         verbose: bool = False,
-        undesired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
-        desired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
-        parent_undesired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
-        parent_desired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']] = None,
     ) -> list:
         """
         Generate candidate action rules.
@@ -169,14 +174,6 @@ class CandidateGenerator:
             Dictionary containing bindings for stable items.
         flexible_items_binding : dict
             Dictionary containing bindings for flexible items.
-        undesired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
-            Packed bit mask for the undesired branch (intersection so far).
-        desired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
-            Packed bit mask for the desired branch (intersection so far).
-        parent_undesired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
-            Parent packed mask used for lazy intersection when branch masks are not materialized.
-        parent_desired_mask_bitset : Union['numpy.ndarray', 'cupy.ndarray'], optional
-            Parent packed mask used for lazy intersection when branch masks are not materialized.
         actionable_attributes : int
             Number of actionable attributes.
         stop_list : list
@@ -207,14 +204,8 @@ class CandidateGenerator:
             k, actionable_attributes, stable_items_binding, flexible_items_binding
         )
 
-        bitset_undesired_mask = None
-        bitset_desired_mask = None
         bitset_undesired_mask, bitset_desired_mask = self._resolve_bitset_masks(
             itemset_prefix,
-            undesired_mask_bitset,
-            desired_mask_bitset,
-            parent_undesired_mask_bitset,
-            parent_desired_mask_bitset,
             undesired_state,
             desired_state,
         )
@@ -276,13 +267,14 @@ class CandidateGenerator:
         new_branches_all = []
         batch_contexts = []
         resolved_batch_size = max(1, int(batch_size))
+        context_batch_size = self._resolve_gpu_context_batch_size(resolved_batch_size)
 
         for candidate in candidates:
             context = self._build_batch_context(candidate, undesired_state, desired_state)
             if context is None:
                 continue
             batch_contexts.append(context)
-            if len(batch_contexts) >= resolved_batch_size:
+            if len(batch_contexts) >= context_batch_size:
                 new_branches_all.extend(
                     self._flush_batch_contexts(
                         batch_contexts,
@@ -326,10 +318,6 @@ class CandidateGenerator:
         """Prepare one context object used by the GPU batch expansion path."""
         bitset_undesired_mask, bitset_desired_mask = self._resolve_bitset_masks(
             candidate.get("itemset_prefix", tuple()),
-            candidate.get("undesired_mask_bitset"),
-            candidate.get("desired_mask_bitset"),
-            candidate.get("parent_undesired_mask_bitset"),
-            candidate.get("parent_desired_mask_bitset"),
             undesired_state,
             desired_state,
         )
@@ -496,10 +484,6 @@ class CandidateGenerator:
                                 "ar_prefix": new_ar_prefix,
                                 "itemset_prefix": new_ar_prefix,
                                 "item": item,
-                                "undesired_mask_bitset": None,
-                                "desired_mask_bitset": None,
-                                "parent_undesired_mask_bitset": context["bitset_undesired_mask"],
-                                "parent_desired_mask_bitset": context["bitset_desired_mask"],
                                 "actionable_attributes": 0,
                             }
                         )
@@ -565,10 +549,6 @@ class CandidateGenerator:
                                 "ar_prefix": new_ar_prefix,
                                 "itemset_prefix": context["itemset_prefix"] + (item,),
                                 "item": item,
-                                "undesired_mask_bitset": None,
-                                "desired_mask_bitset": None,
-                                "parent_undesired_mask_bitset": context["bitset_undesired_mask"],
-                                "parent_desired_mask_bitset": context["bitset_desired_mask"],
                                 "actionable_attributes": context["actionable_attributes"] + 1,
                             }
                         )
@@ -616,10 +596,6 @@ class CandidateGenerator:
     def _resolve_bitset_masks(
         self,
         itemset_prefix: tuple,
-        undesired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']],
-        desired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']],
-        parent_undesired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']],
-        parent_desired_mask_bitset: Optional[Union['numpy.ndarray', 'cupy.ndarray']],
         undesired_state: int,
         desired_state: int,
     ) -> tuple:
@@ -630,17 +606,12 @@ class CandidateGenerator:
         if base_undesired is None or base_desired is None:
             return None, None
 
-        bitset_undesired_mask = undesired_mask_bitset
-        bitset_desired_mask = desired_mask_bitset
-        last_item = itemset_prefix[-1] if itemset_prefix else None
-        if bitset_undesired_mask is None and parent_undesired_mask_bitset is not None and last_item is not None:
-            bitset_undesired_mask = self._intersect_bit_mask(parent_undesired_mask_bitset, last_item)
-        if bitset_desired_mask is None and parent_desired_mask_bitset is not None and last_item is not None:
-            bitset_desired_mask = self._intersect_bit_mask(parent_desired_mask_bitset, last_item)
-        if bitset_undesired_mask is None:
-            bitset_undesired_mask = base_undesired
-        if bitset_desired_mask is None:
-            bitset_desired_mask = base_desired
+        bitset_undesired_mask = base_undesired
+        bitset_desired_mask = base_desired
+        for item in itemset_prefix:
+            item_row = self.bit_masks[item]
+            bitset_undesired_mask = bitset_undesired_mask & item_row
+            bitset_desired_mask = bitset_desired_mask & item_row
         return bitset_undesired_mask, bitset_desired_mask
 
     def reduce_candidates_by_min_attributes(
@@ -771,10 +742,6 @@ class CandidateGenerator:
                             'ar_prefix': new_ar_prefix,
                             'itemset_prefix': new_ar_prefix,
                             'item': item,
-                            'undesired_mask_bitset': None,
-                            'desired_mask_bitset': None,
-                            'parent_undesired_mask_bitset': undesired_mask_bitset,
-                            'parent_desired_mask_bitset': desired_mask_bitset,
                             'actionable_attributes': 0,
                         }
                     )
@@ -877,30 +844,152 @@ class CandidateGenerator:
         return (item_count * num_words) >= cls._gpu_kernel_min_work
 
     @classmethod
+    def _infer_num_words(cls, mask_bitset) -> int:
+        """Infer packed-bitset word count from a 1D/2D mask array."""
+        num_words = None
+        try:
+            shape = getattr(mask_bitset, "shape", None)
+            if shape:
+                num_words = int(shape[-1])
+        except Exception:
+            num_words = None
+        if num_words is None or num_words <= 0:
+            try:
+                num_words = int(mask_bitset.size)
+            except Exception:
+                num_words = 0
+        if num_words < 0:
+            return 0
+        return int(num_words)
+
+    @classmethod
+    def _estimate_gpu_context_bytes(
+        cls,
+        num_words: int,
+        context_count: int,
+    ) -> int:
+        """Estimate bytes needed for stacked branch masks in one GPU batch."""
+        if num_words <= 0 or context_count <= 0:
+            return 0
+        return int(2 * num_words * context_count * cls._gpu_bytes_per_word)
+
+    @classmethod
+    def _compute_gpu_context_batch_size(
+        cls,
+        num_words: int,
+        requested_contexts: int,
+        budget_bytes: int,
+    ) -> int:
+        """Compute context batch size from budget and branch-mask footprint."""
+        if requested_contexts <= 0:
+            return 1
+        if num_words <= 0 or budget_bytes <= 0:
+            return 1
+        per_context_bytes = cls._estimate_gpu_context_bytes(num_words=num_words, context_count=1)
+        available_bytes = budget_bytes - cls._gpu_batch_fixed_overhead_bytes
+        if per_context_bytes <= 0 or available_bytes <= 0:
+            return 1
+        context_batch = available_bytes // per_context_bytes
+        if context_batch < 1:
+            return 1
+        return min(int(context_batch), int(requested_contexts))
+
+    @classmethod
     def _compute_gpu_chunk_items(
         cls,
         num_words: int,
         requested_items: int,
         budget_bytes: int,
-        word_bytes: int = 8,
+        context_count: int = 1,
     ) -> int:
         """
-        Compute how many items can be processed in one GPU chunk under a memory budget.
+        Compute worklist chunk length under the current GPU memory budget.
         """
         if requested_items <= 0:
             return 1
-        if num_words <= 0 or budget_bytes <= 0 or word_bytes <= 0:
+        if num_words <= 0 or budget_bytes <= 0 or context_count <= 0:
             return 1
 
-        # Conservative estimate: item mask load + contiguous conversion + intermediate/output buffers.
-        bytes_per_item = (num_words * word_bytes * 3) + word_bytes
-        if bytes_per_item <= 0:
+        context_bytes = cls._estimate_gpu_context_bytes(num_words=num_words, context_count=context_count)
+        available_bytes = budget_bytes - context_bytes - cls._gpu_batch_fixed_overhead_bytes
+        if available_bytes <= 0:
             return 1
 
-        chunk_items = budget_bytes // bytes_per_item
+        chunk_items = available_bytes // cls._gpu_support_bytes_per_item
         if chunk_items < 1:
             return 1
         return min(requested_items, int(chunk_items))
+
+    def _resolve_gpu_work_budget_bytes(self) -> Optional[int]:
+        """
+        Resolve a conservative GPU work budget in bytes for one batched expansion.
+
+        The resolved budget combines:
+        - user cap (`gpu_batch_budget_mb`) when provided,
+        - remaining room under CuPy pool limit, and
+        - a fraction of currently free device memory.
+        """
+        try:
+            import cupy as cp
+        except ImportError:
+            return None
+
+        budget_bytes = None
+        if self._gpu_batch_budget_mb is not None:
+            budget_bytes = int(self._gpu_batch_budget_mb * 1024 * 1024)
+
+        try:
+            gpu_pool = cp.get_default_memory_pool()
+            pool_limit = int(gpu_pool.get_limit()) if hasattr(gpu_pool, "get_limit") else 0
+            pool_used = int(gpu_pool.used_bytes()) if hasattr(gpu_pool, "used_bytes") else 0
+            if pool_limit > 0:
+                pool_available = max(0, pool_limit - max(0, pool_used))
+                if budget_bytes is None:
+                    budget_bytes = pool_available
+                else:
+                    budget_bytes = min(budget_bytes, pool_available)
+        except Exception:
+            pass
+
+        try:
+            free_bytes, _ = cp.cuda.runtime.memGetInfo()
+            free_mem_budget = int(max(0, free_bytes) * self._gpu_batch_free_mem_fraction)
+            if budget_bytes is None:
+                budget_bytes = free_mem_budget
+            else:
+                budget_bytes = min(budget_bytes, free_mem_budget)
+        except Exception:
+            pass
+
+        if budget_bytes is None:
+            return None
+
+        budget_bytes = int(max(1, budget_bytes) * self._gpu_batch_safety_factor)
+        return max(1, budget_bytes)
+
+    def _resolve_gpu_context_batch_size(
+        self,
+        requested_batch_size: int,
+        budget_bytes: Optional[int] = None,
+    ) -> int:
+        """
+        Resolve a context batch size that fits the current GPU memory budget.
+
+        `num_words` is read from `self.bit_masks`, which is constant for the run.
+        `budget_bytes` may be supplied by the caller to avoid a second resolution
+        when the same value will be reused for chunk sizing later in the batch.
+        """
+        resolved_batch_size = max(1, int(requested_batch_size))
+        num_words = self._infer_num_words(self.bit_masks)
+        if budget_bytes is None:
+            budget_bytes = self._resolve_gpu_work_budget_bytes()
+        if num_words <= 0 or budget_bytes is None or budget_bytes <= 0:
+            return resolved_batch_size
+        return self._compute_gpu_context_batch_size(
+            num_words=num_words,
+            requested_contexts=resolved_batch_size,
+            budget_bytes=budget_bytes,
+        )
 
     @classmethod
     def _get_gpu_support_kernel_multi(cls):
@@ -1024,30 +1113,16 @@ class CandidateGenerator:
             threads_per_block = 256
             shared_mem_bytes = threads_per_block * cp.dtype(cp.uint32).itemsize * 2
 
-            budget_bytes = (
-                int(self._gpu_batch_budget_mb * 1024 * 1024)
-                if self._gpu_batch_budget_mb is not None
-                else None
-            )
-            try:
-                free_bytes, _ = cp.cuda.runtime.memGetInfo()
-                free_mem_budget = int(free_bytes * self._gpu_batch_free_mem_fraction)
-                if free_mem_budget > 0:
-                    budget_bytes = (
-                        free_mem_budget if budget_bytes is None else min(budget_bytes, free_mem_budget)
-                    )
-            except Exception:
-                pass
-
-            bytes_per_item = 2 * cp.dtype(cp.uint64).itemsize
+            budget_bytes = self._resolve_gpu_work_budget_bytes()
             if budget_bytes is None or budget_bytes <= 0:
                 chunk_items = total_items
             else:
-                chunk_items = budget_bytes // bytes_per_item
-                if chunk_items < 1:
-                    chunk_items = 1
-                if chunk_items > total_items:
-                    chunk_items = total_items
+                chunk_items = self._compute_gpu_chunk_items(
+                    num_words=num_words,
+                    requested_items=total_items,
+                    budget_bytes=budget_bytes,
+                    context_count=int(branch_masks_a.shape[0]),
+                )
 
             supports_host_a = np.empty(total_items, dtype=np.int64)
             supports_host_b = np.empty(total_items, dtype=np.int64)
@@ -1081,36 +1156,6 @@ class CandidateGenerator:
             return supports_host_a.tolist(), supports_host_b.tolist()
         except Exception:
             return None
-
-    def _intersect_bit_mask(
-        self, current_mask: Optional[Union['numpy.ndarray', 'cupy.ndarray']], item: int
-    ) -> Optional[Union['numpy.ndarray', 'cupy.ndarray']]:
-        """
-        Combine the current packed mask with the mask of the given item.
-        """
-        if current_mask is None or self.bit_masks is None:
-            return None
-        attribute_mask = self.bit_masks[item]
-        working_mask = current_mask
-        if (
-            hasattr(attribute_mask, "__cuda_array_interface__")
-            and not hasattr(current_mask, "__cuda_array_interface__")
-        ):
-            try:
-                import cupy as cp
-
-                working_mask = cp.asarray(current_mask, dtype=cp.uint64)
-            except Exception:
-                working_mask = current_mask
-        intersection = attribute_mask & working_mask
-        if self._spill_gpu_masks_to_cpu and hasattr(intersection, "__cuda_array_interface__"):
-            try:
-                import cupy as cp
-
-                return cp.asnumpy(intersection)
-            except Exception:
-                return intersection
-        return intersection
 
     def _popcount(self, mask: Union['numpy.ndarray', 'cupy.ndarray']) -> int:
         """
@@ -1258,10 +1303,6 @@ class CandidateGenerator:
                             'ar_prefix': new_ar_prefix,
                             'itemset_prefix': itemset_prefix + (item,),
                             'item': item,
-                            'undesired_mask_bitset': None,
-                            'desired_mask_bitset': None,
-                            'parent_undesired_mask_bitset': undesired_mask_bitset,
-                            'parent_desired_mask_bitset': desired_mask_bitset,
                             'actionable_attributes': actionable_attributes + 1,
                         }
                     )

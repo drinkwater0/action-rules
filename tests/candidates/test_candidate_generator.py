@@ -120,10 +120,8 @@ def test_generate_candidates_creates_bitset_branches(sample_generator):
     )
 
     assert new_branches
-    assert all(branch['undesired_mask_bitset'] is None for branch in new_branches)
-    assert all(branch['desired_mask_bitset'] is None for branch in new_branches)
-    assert all(branch['parent_undesired_mask_bitset'] is not None for branch in new_branches)
-    assert all(branch['parent_desired_mask_bitset'] is not None for branch in new_branches)
+    assert all('itemset_prefix' in branch for branch in new_branches)
+    assert all('stable_items_binding' in branch for branch in new_branches)
 
 
 def test_generate_candidates_batch_matches_single(sample_generator):
@@ -132,8 +130,6 @@ def test_generate_candidates_batch_matches_single(sample_generator):
         'itemset_prefix': tuple(),
         'stable_items_binding': {'stable': [2]},
         'flexible_items_binding': {},
-        'undesired_mask_bitset': None,
-        'desired_mask_bitset': None,
         'actionable_attributes': 0,
     }
 
@@ -174,4 +170,27 @@ def test_in_stop_list(sample_generator):
 
 
 def test_compute_gpu_chunk_items_has_minimum_one(sample_generator):
-    assert sample_generator._compute_gpu_chunk_items(num_words=256, requested_items=50, budget_bytes=1) == 1
+    assert (
+        sample_generator._compute_gpu_chunk_items(
+            num_words=256,
+            requested_items=50,
+            budget_bytes=1,
+            context_count=1,
+        )
+        == 1
+    )
+
+
+def test_compute_gpu_context_batch_size_respects_budget(sample_generator):
+    num_words = 256
+    per_context = sample_generator._estimate_gpu_context_bytes(num_words=num_words, context_count=1)
+    fixed = sample_generator._gpu_batch_fixed_overhead_bytes
+    budget = fixed + (3 * per_context)
+    assert (
+        sample_generator._compute_gpu_context_batch_size(
+            num_words=num_words,
+            requested_contexts=16,
+            budget_bytes=budget,
+        )
+        == 3
+    )

@@ -617,14 +617,6 @@ class ActionRules:
         self.frames_bit_masks = None
         self.set_array_library(use_gpu, data)
         previous_gpu_pool_limit = None
-        if self.is_gpu_np and max_gpu_mem_mb is not None:
-            try:
-                gpu_pool = self.np.get_default_memory_pool()  # type: ignore[attr-defined]
-                if hasattr(gpu_pool, "get_limit"):
-                    previous_gpu_pool_limit = int(gpu_pool.get_limit())
-                gpu_pool.set_limit(size=int(max_gpu_mem_mb) * 1024 * 1024)
-            except Exception:
-                previous_gpu_pool_limit = None
         if not self.is_onehot:
             data = self.one_hot_encode(data, stable_attributes, flexible_attributes, target)
         data, columns = self.df_to_array(data)
@@ -638,6 +630,22 @@ class ActionRules:
         local_bit_masks = self.build_bit_masks(data)
         self._cache_bitset_structures(local_bit_masks, target_items_binding, target)
         self.frames_bit_masks = self.get_split_bit_masks(target_items_binding, target)
+
+        if self.is_gpu_np and max_gpu_mem_mb is not None:
+            static_mb = self.bit_masks.nbytes / (1024 * 1024)
+            if max_gpu_mem_mb < static_mb + 16:
+                raise ValueError(
+                    f"max_gpu_mem_mb={max_gpu_mem_mb} is too low for this dataset; "
+                    f"bit_masks alone need {static_mb:.0f} MB on GPU. "
+                    f"Increase the cap (>= {int(static_mb) + 16} MB) or run on CPU."
+                )
+            try:
+                gpu_pool = self.np.get_default_memory_pool()  # type: ignore[attr-defined]
+                if hasattr(gpu_pool, "get_limit"):
+                    previous_gpu_pool_limit = int(gpu_pool.get_limit())
+                gpu_pool.set_limit(size=int(max_gpu_mem_mb) * 1024 * 1024)
+            except Exception:
+                previous_gpu_pool_limit = None
 
         if self.verbose:
             print('Maximum number of nodes to check for support:')
@@ -658,8 +666,6 @@ class ActionRules:
             'itemset_prefix': tuple(),
             'stable_items_binding': stable_items_binding,
             'flexible_items_binding': flexible_items_binding,
-            'undesired_mask_bitset': None,
-            'desired_mask_bitset': None,
             'actionable_attributes': 0,
         }
         candidates_pool = deque([initial_candidate])
@@ -688,7 +694,6 @@ class ActionRules:
             desired_state=desired_state,
             rules=self.rules,
             gpu_batch_budget_mb=max_gpu_mem_mb,
-            spill_gpu_masks_to_cpu=bool(self.is_gpu_np and max_gpu_mem_mb is not None),
         )
         effective_gpu_node_batch_size = (
             gpu_node_batch_size if gpu_node_batch_size is not None else 32
