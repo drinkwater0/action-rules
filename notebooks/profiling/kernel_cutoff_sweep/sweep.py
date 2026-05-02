@@ -18,13 +18,14 @@ from typing import Iterable, Optional
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = CURRENT_DIR.parent.parent
+REPO_ROOT = CURRENT_DIR.parents[2]
 SRC_DIR = REPO_ROOT / "src"
+PROFILING_DIR = CURRENT_DIR.parent
 
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR))
+if str(PROFILING_DIR) not in sys.path:
+    sys.path.insert(0, str(PROFILING_DIR))
 
 from action_rules.candidates.candidate_generator import CandidateGenerator
 from benchmark_runner import list_dataset_presets, run_profile
@@ -72,7 +73,7 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
 
 
 def _summarize_records(records: list[dict]) -> list[dict]:
-    grouped: dict[tuple[str, int], list[float]] = {}
+    grouped: dict[tuple[str, int], dict[str, list[float]]] = {}
     for row in records:
         if row.get("actual_backend") != "gpu":
             continue
@@ -80,24 +81,35 @@ def _summarize_records(records: list[dict]) -> list[dict]:
         if elapsed is None:
             continue
         key = (str(row["dataset_key"]), int(row["gpu_kernel_min_work"]))
-        grouped.setdefault(key, []).append(float(elapsed))
+        bucket = grouped.setdefault(key, {"elapsed": [], "vram": []})
+        bucket["elapsed"].append(float(elapsed))
+        vram = row.get("peak_vram_mb")
+        if vram is not None:
+            bucket["vram"].append(float(vram))
 
     summary = []
     for (dataset_key, threshold), values in grouped.items():
-        values_sorted = sorted(values)
+        elapsed_sorted = sorted(values["elapsed"])
+        vram_values = values["vram"]
         summary.append(
             {
                 "dataset_key": dataset_key,
                 "gpu_kernel_min_work": int(threshold),
-                "runs": int(len(values_sorted)),
-                "mean_elapsed_seconds": float(statistics.fmean(values_sorted)),
-                "median_elapsed_seconds": float(statistics.median(values_sorted)),
-                "min_elapsed_seconds": float(values_sorted[0]),
-                "max_elapsed_seconds": float(values_sorted[-1]),
+                "runs": int(len(elapsed_sorted)),
+                "mean_elapsed_seconds": float(statistics.fmean(elapsed_sorted)),
+                "median_elapsed_seconds": float(statistics.median(elapsed_sorted)),
+                "min_elapsed_seconds": float(elapsed_sorted[0]),
+                "max_elapsed_seconds": float(elapsed_sorted[-1]),
                 "stdev_elapsed_seconds": (
-                    float(statistics.pstdev(values_sorted))
-                    if len(values_sorted) > 1
+                    float(statistics.pstdev(elapsed_sorted))
+                    if len(elapsed_sorted) > 1
                     else 0.0
+                ),
+                "mean_peak_vram_mb": (
+                    float(statistics.fmean(vram_values)) if vram_values else None
+                ),
+                "max_peak_vram_mb": (
+                    float(max(vram_values)) if vram_values else None
                 ),
             }
         )
@@ -173,14 +185,20 @@ def run_sweep(
                         "status": str(result.get("status", "")),
                         "actual_backend": str(result.get("actual_backend", "")),
                         "elapsed_seconds": float(result.get("elapsed_seconds", 0.0)),
+                        "peak_vram_mb": result.get("peak_vram_mb"),
                         "rule_count": int(result.get("rule_count", 0)),
                         "gpu_node_batch_size": result.get("gpu_node_batch_size"),
                         "max_gpu_mem_mb": result.get("max_gpu_mem_mb"),
                     }
                     records.append(row)
+                    vram_str = (
+                        f" vram={row['peak_vram_mb']:.1f}MB"
+                        if row["peak_vram_mb"] is not None
+                        else ""
+                    )
                     print(
                         f"[dataset={dataset}] threshold={threshold} run={run_index + 1}/{run_count} "
-                        f"backend={row['actual_backend']} elapsed={row['elapsed_seconds']:.6f}s"
+                        f"backend={row['actual_backend']} elapsed={row['elapsed_seconds']:.6f}s{vram_str}"
                     )
     finally:
         CandidateGenerator._gpu_kernel_min_work = original_threshold

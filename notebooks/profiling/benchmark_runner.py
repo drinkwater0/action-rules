@@ -23,6 +23,80 @@ from benchmark_datasets import DATASET_PRESETS, list_dataset_presets, load_frame
 
 
 # ------------------------------------------------------------------
+# Warmup + VRAM measurement helpers
+# ------------------------------------------------------------------
+
+_warmup_done = False
+
+
+def _ensure_gpu_warmup(data_frame, preset, use_gpu: bool) -> None:
+    """Run one untimed GPU fit per process to pay NVRTC compile + CuPy init.
+
+    The first GPU fit in a process pays one-time costs that distort timed
+    measurements: NVRTC compiles the RawKernel, CuPy initializes its memory
+    pool, the driver allocates contexts. Doing one throwaway fit before the
+    real measurement isolates those costs from `elapsed_seconds`.
+    """
+    global _warmup_done
+    if _warmup_done or not use_gpu:
+        _warmup_done = True
+        return
+    try:
+        sample = data_frame.head(min(200, len(data_frame)))
+        helper = ActionRules(
+            min_stable_attributes=preset.min_stable_attributes,
+            min_flexible_attributes=preset.min_flexible_attributes,
+            min_undesired_support=1,
+            min_undesired_confidence=0.0,
+            min_desired_support=1,
+            min_desired_confidence=0.0,
+            verbose=False,
+        )
+        helper.fit(
+            data=sample,
+            stable_attributes=list(preset.stable_attributes),
+            flexible_attributes=list(preset.flexible_attributes),
+            target=preset.target,
+            target_undesired_state=preset.undesired_state,
+            target_desired_state=preset.desired_state,
+            use_gpu=True,
+        )
+    except Exception:
+        pass
+    finally:
+        _warmup_done = True
+
+
+def _reset_cupy_pool_baseline() -> tuple[object, int]:
+    """Free cached pool blocks and return the post-reset baseline allocation."""
+    try:
+        import cupy as cp
+    except ImportError:
+        return None, 0
+    mempool = cp.get_default_memory_pool()
+    try:
+        mempool.free_all_blocks()
+    except Exception:
+        pass
+    try:
+        baseline_bytes = int(mempool.total_bytes())
+    except Exception:
+        baseline_bytes = 0
+    return mempool, baseline_bytes
+
+
+def _measure_peak_vram_mb(mempool: object, baseline_bytes: int) -> Optional[float]:
+    """Compute peak VRAM used by CuPy during the timed window, in MB."""
+    if mempool is None:
+        return None
+    try:
+        delta_bytes = max(0, int(mempool.total_bytes()) - int(baseline_bytes))
+    except Exception:
+        return None
+    return float(delta_bytes) / (1024.0 * 1024.0)
+
+
+# ------------------------------------------------------------------
 # Dataset helpers
 # ------------------------------------------------------------------
 
@@ -120,6 +194,8 @@ def _fit_profile_once(
     requested_backend: str,
     emit_summary: bool,
 ) -> dict:
+    _ensure_gpu_warmup(data_frame, preset, bool(use_gpu))
+
     action_rules = ActionRules(
         min_stable_attributes=preset.min_stable_attributes,
         min_flexible_attributes=preset.min_flexible_attributes,
@@ -128,6 +204,10 @@ def _fit_profile_once(
         min_desired_support=effective_support,
         min_desired_confidence=effective_confidence,
         verbose=verbose,
+    )
+
+    mempool, baseline_pool_bytes = (
+        _reset_cupy_pool_baseline() if use_gpu else (None, 0)
     )
 
     started = perf_counter()
@@ -143,6 +223,8 @@ def _fit_profile_once(
         gpu_node_batch_size=gpu_node_batch_size,
     )
     elapsed = perf_counter() - started
+
+    peak_vram_mb = _measure_peak_vram_mb(mempool, baseline_pool_bytes)
 
     rule_count = len(action_rules.get_rules().action_rules)
     actual_backend = "gpu" if action_rules.is_gpu_np else "cpu"
@@ -170,6 +252,7 @@ def _fit_profile_once(
         "rows": int(len(data_frame)),
         "rule_count": int(rule_count),
         "elapsed_seconds": float(elapsed),
+        "peak_vram_mb": None if peak_vram_mb is None else float(peak_vram_mb),
         "max_gpu_mem_mb": None if max_gpu_mem_mb is None else int(max_gpu_mem_mb),
         "gpu_node_batch_size": None if gpu_node_batch_size is None else int(gpu_node_batch_size),
         "min_support_count_effective": int(effective_support),
@@ -182,6 +265,8 @@ def _fit_profile_once(
         print(f"Rows: {len(data_frame)}")
         print(f"Number of action rules: {rule_count}")
         print(f"Elapsed seconds: {elapsed:.6f}")
+        if peak_vram_mb is not None:
+            print(f"Peak VRAM (CuPy pool): {peak_vram_mb:.2f} MB")
         if note:
             print(f"Note: {note}")
     return result
