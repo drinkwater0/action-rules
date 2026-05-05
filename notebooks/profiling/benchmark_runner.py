@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -26,41 +27,96 @@ from benchmark_datasets import DATASET_PRESETS, list_dataset_presets, load_frame
 # Warmup + VRAM measurement helpers
 # ------------------------------------------------------------------
 
+# Flip to False to disable overlapped warmup and fall back to the synchronous
+# pre-fit warmup (deterministic, simpler). True runs a full dummy GPU fit on a
+# synthetic frame in a background thread, overlapping CuPy import + RawKernel
+# JIT with the CPU dataset load so the first real fit is already steady-state.
+GPU_WARMUP_OVERLAP = True
+
 _warmup_done = False
+_warmup_thread: Optional[threading.Thread] = None
+_warmup_lock = threading.Lock()
+
+
+def _build_synthetic_warmup_frame(preset):
+    """Tiny pandas frame matching preset schema, enough to trigger a real GPU fit."""
+    import pandas as pd
+
+    rows = 200
+    columns = {}
+    for col in preset.stable_attributes:
+        columns[col] = (["s0", "s1"] * ((rows + 1) // 2))[:rows]
+    for col in preset.flexible_attributes:
+        columns[col] = (["a", "b"] * ((rows + 1) // 2))[:rows]
+    columns[preset.target] = (
+        [preset.undesired_state, preset.desired_state] * ((rows + 1) // 2)
+    )[:rows]
+    return pd.DataFrame(columns)
+
+
+def _run_dummy_fit(preset, sample) -> None:
+    """Untimed GPU fit used to pay NVRTC compile + CuPy init costs."""
+    helper = ActionRules(
+        min_stable_attributes=preset.min_stable_attributes,
+        min_flexible_attributes=preset.min_flexible_attributes,
+        min_undesired_support=1,
+        min_undesired_confidence=0.0,
+        min_desired_support=1,
+        min_desired_confidence=0.0,
+        verbose=False,
+    )
+    helper.fit(
+        data=sample,
+        stable_attributes=list(preset.stable_attributes),
+        flexible_attributes=list(preset.flexible_attributes),
+        target=preset.target,
+        target_undesired_state=preset.undesired_state,
+        target_desired_state=preset.desired_state,
+        use_gpu=True,
+    )
+
+
+def _async_warmup_body(preset) -> None:
+    try:
+        sample = _build_synthetic_warmup_frame(preset)
+        _run_dummy_fit(preset, sample)
+    except Exception:
+        pass
+
+
+def _start_gpu_warmup_async(preset, use_gpu: bool) -> None:
+    """Kick off background dummy fit so it overlaps with CPU dataset prep."""
+    global _warmup_thread
+    if not GPU_WARMUP_OVERLAP or not use_gpu or _warmup_done:
+        return
+    with _warmup_lock:
+        if _warmup_thread is not None or _warmup_done:
+            return
+        _warmup_thread = threading.Thread(
+            target=_async_warmup_body, args=(preset,), name="gpu-warmup", daemon=True
+        )
+        _warmup_thread.start()
 
 
 def _ensure_gpu_warmup(data_frame, preset, use_gpu: bool) -> None:
-    """Run one untimed GPU fit per process to pay NVRTC compile + CuPy init.
+    """Make sure GPU warmup is finished before the timed fit.
 
-    The first GPU fit in a process pays one-time costs that distort timed
-    measurements: NVRTC compiles the RawKernel, CuPy initializes its memory
-    pool, the driver allocates contexts. Doing one throwaway fit before the
-    real measurement isolates those costs from `elapsed_seconds`.
+    If the async thread was started, just join it — the dummy fit already ran on
+    the background thread in parallel with dataset loading. Otherwise fall back
+    to a synchronous dummy fit on a slice of the real frame.
     """
-    global _warmup_done
+    global _warmup_done, _warmup_thread
     if _warmup_done or not use_gpu:
+        _warmup_done = True
+        return
+    if _warmup_thread is not None:
+        _warmup_thread.join()
+        _warmup_thread = None
         _warmup_done = True
         return
     try:
         sample = data_frame.head(min(200, len(data_frame)))
-        helper = ActionRules(
-            min_stable_attributes=preset.min_stable_attributes,
-            min_flexible_attributes=preset.min_flexible_attributes,
-            min_undesired_support=1,
-            min_undesired_confidence=0.0,
-            min_desired_support=1,
-            min_desired_confidence=0.0,
-            verbose=False,
-        )
-        helper.fit(
-            data=sample,
-            stable_attributes=list(preset.stable_attributes),
-            flexible_attributes=list(preset.flexible_attributes),
-            target=preset.target,
-            target_undesired_state=preset.undesired_state,
-            target_desired_state=preset.desired_state,
-            use_gpu=True,
-        )
+        _run_dummy_fit(preset, sample)
     except Exception:
         pass
     finally:
@@ -100,10 +156,12 @@ def _measure_peak_vram_mb(mempool: object, baseline_bytes: int) -> Optional[floa
 # Dataset helpers
 # ------------------------------------------------------------------
 
-def _load_preset_and_frame(dataset: str):
-    preset = DATASET_PRESETS[normalize_dataset_key(dataset)]
-    data_frame = load_frame(preset.path, preset.sep)
+def _resolve_preset(dataset: str):
+    return DATASET_PRESETS[normalize_dataset_key(dataset)]
 
+
+def _load_frame_for_preset(preset):
+    data_frame = load_frame(preset.path, preset.sep)
     missing = [
         col
         for col in [*preset.stable_attributes, *preset.flexible_attributes, preset.target]
@@ -111,6 +169,12 @@ def _load_preset_and_frame(dataset: str):
     ]
     if missing:
         raise ValueError(f"Dataset '{preset.name}' is missing required columns: {missing}")
+    return data_frame
+
+
+def _load_preset_and_frame(dataset: str):
+    preset = _resolve_preset(dataset)
+    data_frame = _load_frame_for_preset(preset)
     return preset, data_frame
 
 
@@ -378,7 +442,10 @@ def run_profile(
     elif gpu_batch_size is not None and int(gpu_node_batch_size) != int(gpu_batch_size):
         raise ValueError("gpu_node_batch_size and gpu_batch_size must match when both are provided.")
 
-    preset, data_frame = _load_preset_and_frame(dataset)
+    total_started = perf_counter()
+    preset = _resolve_preset(dataset)
+    _start_gpu_warmup_async(preset, use_gpu=bool(use_gpu) or autotune)
+    data_frame = _load_frame_for_preset(preset)
     dataset_prof = profile_dataset_frame(data_frame, preset) if (include_dataset_profile or autotune) else None
 
     if autotune:
@@ -401,12 +468,14 @@ def run_profile(
         result["autotune"] = autotune_summary
         if dataset_prof is not None:
             result["dataset_profile"] = dataset_prof
+        result["total_seconds"] = float(perf_counter() - total_started)
         print(
             "Autotune selected:",
             f"backend={'gpu' if autotune_summary['selected_use_gpu'] else 'cpu'}",
             f"gpu_node_batch_size={autotune_summary['selected_gpu_node_batch_size']}",
             f"sample_rows={autotune_summary['sample_rows']}",
         )
+        print(f"Total seconds (load + warmup + fit): {result['total_seconds']:.6f}")
         return result
 
     effective_support, effective_confidence = _compute_effective_thresholds(
@@ -429,6 +498,8 @@ def run_profile(
     )
     if dataset_prof is not None:
         result["dataset_profile"] = dataset_prof
+    result["total_seconds"] = float(perf_counter() - total_started)
+    print(f"Total seconds (load + warmup + fit): {result['total_seconds']:.6f}")
     return result
 
 
