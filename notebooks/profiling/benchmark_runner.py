@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -18,109 +17,24 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from action_rules import ActionRules
+from action_rules.gpu_warmup import disable as _disable_gpu_warmup
 from action_rules.profiling import profile_dataset as _profile_dataset_core
 from action_rules.autotuning import autotune as _autotune_core
 from benchmark_datasets import DATASET_PRESETS, list_dataset_presets, load_frame, normalize_dataset_key
 
 
 # ------------------------------------------------------------------
-# Warmup + VRAM measurement helpers
+# Warmup toggle (delegates to the action_rules package)
 # ------------------------------------------------------------------
 
-# Flip to False to disable overlapped warmup and fall back to the synchronous
-# pre-fit warmup (deterministic, simpler). True runs a full dummy GPU fit on a
-# synthetic frame in a background thread, overlapping CuPy import + RawKernel
-# JIT with the CPU dataset load so the first real fit is already steady-state.
+# Flip to False to disable the package-level async GPU warmup (falls back to
+# paying CuPy import + RawKernel JIT inside the first timed fit). The actual
+# warmup logic lives in `action_rules/gpu_warmup.py` so library users get the
+# overlap automatically — this flag only exists for benchmarking A/B runs.
 GPU_WARMUP_OVERLAP = True
 
-_warmup_done = False
-_warmup_thread: Optional[threading.Thread] = None
-_warmup_lock = threading.Lock()
-
-
-def _build_synthetic_warmup_frame(preset):
-    """Tiny pandas frame matching preset schema, enough to trigger a real GPU fit."""
-    import pandas as pd
-
-    rows = 200
-    columns = {}
-    for col in preset.stable_attributes:
-        columns[col] = (["s0", "s1"] * ((rows + 1) // 2))[:rows]
-    for col in preset.flexible_attributes:
-        columns[col] = (["a", "b"] * ((rows + 1) // 2))[:rows]
-    columns[preset.target] = (
-        [preset.undesired_state, preset.desired_state] * ((rows + 1) // 2)
-    )[:rows]
-    return pd.DataFrame(columns)
-
-
-def _run_dummy_fit(preset, sample) -> None:
-    """Untimed GPU fit used to pay NVRTC compile + CuPy init costs."""
-    helper = ActionRules(
-        min_stable_attributes=preset.min_stable_attributes,
-        min_flexible_attributes=preset.min_flexible_attributes,
-        min_undesired_support=1,
-        min_undesired_confidence=0.0,
-        min_desired_support=1,
-        min_desired_confidence=0.0,
-        verbose=False,
-    )
-    helper.fit(
-        data=sample,
-        stable_attributes=list(preset.stable_attributes),
-        flexible_attributes=list(preset.flexible_attributes),
-        target=preset.target,
-        target_undesired_state=preset.undesired_state,
-        target_desired_state=preset.desired_state,
-        use_gpu=True,
-    )
-
-
-def _async_warmup_body(preset) -> None:
-    try:
-        sample = _build_synthetic_warmup_frame(preset)
-        _run_dummy_fit(preset, sample)
-    except Exception:
-        pass
-
-
-def _start_gpu_warmup_async(preset, use_gpu: bool) -> None:
-    """Kick off background dummy fit so it overlaps with CPU dataset prep."""
-    global _warmup_thread
-    if not GPU_WARMUP_OVERLAP or not use_gpu or _warmup_done:
-        return
-    with _warmup_lock:
-        if _warmup_thread is not None or _warmup_done:
-            return
-        _warmup_thread = threading.Thread(
-            target=_async_warmup_body, args=(preset,), name="gpu-warmup", daemon=True
-        )
-        _warmup_thread.start()
-
-
-def _ensure_gpu_warmup(data_frame, preset, use_gpu: bool) -> None:
-    """Make sure GPU warmup is finished before the timed fit.
-
-    If the async thread was started, just join it — the dummy fit already ran on
-    the background thread in parallel with dataset loading. Otherwise fall back
-    to a synchronous dummy fit on a slice of the real frame.
-    """
-    global _warmup_done, _warmup_thread
-    if _warmup_done or not use_gpu:
-        _warmup_done = True
-        return
-    if _warmup_thread is not None:
-        _warmup_thread.join()
-        _warmup_thread = None
-        _warmup_done = True
-        return
-    try:
-        sample = data_frame.head(min(200, len(data_frame)))
-        _run_dummy_fit(preset, sample)
-    except Exception:
-        pass
-    finally:
-        _warmup_done = True
+if not GPU_WARMUP_OVERLAP:
+    _disable_gpu_warmup()
 
 
 def _reset_cupy_pool_baseline() -> tuple[object, int]:
@@ -258,8 +172,6 @@ def _fit_profile_once(
     requested_backend: str,
     emit_summary: bool,
 ) -> dict:
-    _ensure_gpu_warmup(data_frame, preset, bool(use_gpu))
-
     action_rules = ActionRules(
         min_stable_attributes=preset.min_stable_attributes,
         min_flexible_attributes=preset.min_flexible_attributes,
@@ -444,7 +356,6 @@ def run_profile(
 
     total_started = perf_counter()
     preset = _resolve_preset(dataset)
-    _start_gpu_warmup_async(preset, use_gpu=bool(use_gpu) or autotune)
     data_frame = _load_frame_for_preset(preset)
     dataset_prof = profile_dataset_frame(data_frame, preset) if (include_dataset_profile or autotune) else None
 

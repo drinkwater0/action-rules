@@ -565,6 +565,24 @@ class ActionRules:
         elif gpu_batch_size is not None and int(gpu_node_batch_size) != int(gpu_batch_size):
             raise ValueError("gpu_node_batch_size and gpu_batch_size must match when both are provided.")
 
+        # Start GPU warmup early so CuPy import + RawKernel JIT overlap with
+        # the CPU prep below (one-hot encode, bit-mask construction). Idempotent
+        # across fit() calls in the same process.
+        from .gpu_warmup import start_gpu_warmup_async, ensure_gpu_warmup_done
+        _maybe_uses_gpu = (use_gpu is True) or (
+            isinstance(use_gpu, str) and use_gpu.lower() == "auto"
+        )
+        start_gpu_warmup_async(
+            min_stable_attributes=self.min_stable_attributes,
+            min_flexible_attributes=self.min_flexible_attributes,
+            stable_attributes=stable_attributes,
+            flexible_attributes=flexible_attributes,
+            target=target,
+            target_undesired_state=target_undesired_state,
+            target_desired_state=target_desired_state,
+            use_gpu=_maybe_uses_gpu,
+        )
+
         # --- Auto backend selection via profiling + sampled autotuning ----
         if use_gpu == "auto":
             from .autotuning import autotune
@@ -615,6 +633,7 @@ class ActionRules:
         self.bit_masks = None
         self.target_state_bit_masks = None
         self.frames_bit_masks = None
+        ensure_gpu_warmup_done(bool(use_gpu))
         self.set_array_library(use_gpu, data)
         previous_gpu_pool_limit = None
         if not self.is_onehot:

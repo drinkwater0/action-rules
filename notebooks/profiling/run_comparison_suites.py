@@ -916,25 +916,25 @@ def main() -> None:
             f"Defaults to: {','.join(BITSET_MODES)}"
         ),
     )
-    parser.add_argument("--runs-fim", type=int, default=3, help="Measured runs per dataset/algorithm for FIM suite.")
-    parser.add_argument("--warmup-fim", type=int, default=1, help="Warmup runs per dataset for FIM suite.")
+    parser.add_argument("--runs-fim", type=int, default=10, help="Measured runs per dataset/algorithm for FIM suite.")
+    parser.add_argument("--warmup-fim", type=int, default=2, help="Warmup runs per dataset for FIM suite.")
     parser.add_argument(
         "--runs-rules",
         type=int,
-        default=3,
+        default=10,
         help="Measured runs per dataset/algorithm for action-rules suite.",
     )
-    parser.add_argument("--warmup-rules", type=int, default=1, help="Warmup runs per dataset for action-rules suite.")
+    parser.add_argument("--warmup-rules", type=int, default=2, help="Warmup runs per dataset for action-rules suite.")
     parser.add_argument(
         "--runs-bitset",
         type=int,
-        default=5,
+        default=10,
         help="Measured runs per dataset/mode for ActionRules CPU-vs-GPU suite.",
     )
     parser.add_argument(
         "--warmup-bitset",
         type=int,
-        default=1,
+        default=2,
         help="Warmup runs per dataset/mode for ActionRules CPU-vs-GPU suite.",
     )
     parser.add_argument(
