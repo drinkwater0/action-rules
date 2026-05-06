@@ -150,6 +150,7 @@ def run_sweep(
     datasets: list[str],
     thresholds: list[int],
     runs: int,
+    warmup_runs: int = 2,
     max_gpu_mem_mb: Optional[int],
     gpu_node_batch_size: Optional[int],
     min_support_count: Optional[int],
@@ -160,7 +161,31 @@ def run_sweep(
     records = []
     original_threshold = int(CandidateGenerator._gpu_kernel_min_work)
     run_count = max(1, int(runs))
+    warmup_count = max(0, int(warmup_runs))
     try:
+        # Untimed warmup to absorb GPU cold-start (CuPy import, RawKernel JIT,
+        # OS file cache). Uses the first (dataset, threshold) pair; results
+        # are discarded.
+        if warmup_count and datasets and thresholds:
+            CandidateGenerator._gpu_kernel_min_work = int(thresholds[0])
+            for warmup_index in range(warmup_count):
+                print(
+                    f"[warmup {warmup_index + 1}/{warmup_count}] dataset={datasets[0]} "
+                    f"threshold={thresholds[0]} (untimed)"
+                )
+                run_profile(
+                    use_gpu=True,
+                    dataset=datasets[0],
+                    repeat_factor=1,
+                    max_gpu_mem_mb=max_gpu_mem_mb,
+                    gpu_node_batch_size=gpu_node_batch_size,
+                    min_support_count=min_support_count,
+                    min_confidence=min_confidence,
+                    verbose=False,
+                    include_dataset_profile=False,
+                    autotune=False,
+                )
+
         for dataset in datasets:
             for threshold in thresholds:
                 CandidateGenerator._gpu_kernel_min_work = int(threshold)
@@ -225,11 +250,19 @@ def main() -> None:
         help="Comma-separated non-negative thresholds to test.",
     )
     parser.add_argument(
-        
         "--runs",
         type=int,
         default=3,
         help="Repetitions per (dataset, threshold) pair.",
+    )
+    parser.add_argument(
+        "--warmup-runs",
+        type=int,
+        default=2,
+        help=(
+            "Untimed warmup runs before the sweep starts (uses the first "
+            "dataset/threshold pair). Absorbs CuPy import + RawKernel JIT."
+        ),
     )
     parser.add_argument(
         "--max-gpu-mem-mb",
@@ -292,6 +325,7 @@ def main() -> None:
         datasets=datasets,
         thresholds=thresholds,
         runs=runs,
+        warmup_runs=max(0, int(args.warmup_runs)),
         max_gpu_mem_mb=args.max_gpu_mem_mb,
         gpu_node_batch_size=args.gpu_node_batch_size,
         min_support_count=args.min_support_count,

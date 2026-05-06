@@ -17,7 +17,10 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from action_rules import ActionRules
-from action_rules.gpu_warmup import disable as _disable_gpu_warmup
+from action_rules.gpu_warmup import (
+    disable as _disable_gpu_warmup,
+    start_gpu_warmup_async as _start_gpu_warmup_async,
+)
 from action_rules.profiling import profile_dataset as _profile_dataset_core
 from action_rules.autotuning import autotune as _autotune_core
 from benchmark_datasets import DATASET_PRESETS, list_dataset_presets, load_frame, normalize_dataset_key
@@ -356,6 +359,21 @@ def run_profile(
 
     total_started = perf_counter()
     preset = _resolve_preset(dataset)
+
+    # Fire GPU warmup before the CSV load so it overlaps with disk + parsing.
+    # fit() also calls this, but the package-level warmup is idempotent — the
+    # second call sees the thread already running and is a no-op.
+    _start_gpu_warmup_async(
+        min_stable_attributes=preset.min_stable_attributes,
+        min_flexible_attributes=preset.min_flexible_attributes,
+        stable_attributes=preset.stable_attributes,
+        flexible_attributes=preset.flexible_attributes,
+        target=preset.target,
+        target_undesired_state=preset.undesired_state,
+        target_desired_state=preset.desired_state,
+        use_gpu=bool(use_gpu) or autotune,
+    )
+
     data_frame = _load_frame_for_preset(preset)
     dataset_prof = profile_dataset_frame(data_frame, preset) if (include_dataset_profile or autotune) else None
 
@@ -531,7 +549,15 @@ def main() -> None:
         help="Print available dataset presets and exit.",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose mining output.")
+    parser.add_argument(
+        "--no-warmup",
+        action="store_true",
+        help="Disable the async GPU warmup so the first fit pays full cold-start cost (A/B benchmarking).",
+    )
     args = parser.parse_args()
+
+    if args.no_warmup:
+        _disable_gpu_warmup()
 
     if args.list_datasets:
         print("Available datasets:", ", ".join(list_dataset_presets()))

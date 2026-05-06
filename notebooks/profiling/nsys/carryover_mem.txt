@@ -1,0 +1,15 @@
+
+NOTICE: Existing SQLite export found: carryover.sqlite
+        It is assumed file was previously exported from: carryover.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [carryover.sqlite] with [/opt/nvidia/nsight-systems/2023.2.3/host-linux-x64/reports/cuda_gpu_mem_size_sum.py]... 
+
+ ** CUDA GPU MemOps Summary (by Size) (cuda_gpu_mem_size_sum):
+
+ Total (MB)  Count  Avg (MB)  Med (MB)  Min (MB)  Max (MB)  StdDev (MB)      Operation     
+ ----------  -----  --------  --------  --------  --------  -----------  ------------------
+     29.387  1,398     0.021     0.000     0.000    28.731        0.768  [CUDA memcpy HtoD]
+      0.637    702     0.001     0.000     0.000     0.010        0.001  [CUDA memset]     
+      0.632    706     0.001     0.000     0.000     0.010        0.001  [CUDA memcpy DtoH]
+

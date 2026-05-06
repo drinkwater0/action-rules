@@ -1,0 +1,15 @@
+
+NOTICE: Existing SQLite export found: prefix_only.sqlite
+        It is assumed file was previously exported from: prefix_only.nsys-rep
+        Consider using --force-export=true if needed.
+
+Processing [prefix_only.sqlite] with [/opt/nvidia/nsight-systems/2023.2.3/host-linux-x64/reports/cuda_gpu_mem_size_sum.py]... 
+
+ ** CUDA GPU MemOps Summary (by Size) (cuda_gpu_mem_size_sum):
+
+ Total (MB)  Count  Avg (MB)  Med (MB)  Min (MB)  Max (MB)  StdDev (MB)      Operation     
+ ----------  -----  --------  --------  --------  --------  -----------  ------------------
+     29.383  1,397     0.021     0.000     0.000    28.731        0.769  [CUDA memcpy HtoD]
+      0.635    701     0.001     0.000     0.000     0.010        0.001  [CUDA memset]     
+      0.631    700     0.001     0.000     0.000     0.010        0.001  [CUDA memcpy DtoH]
+
