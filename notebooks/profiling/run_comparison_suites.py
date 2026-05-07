@@ -245,6 +245,7 @@ def _run_fim_suite(
     tag: str,
     spmf_jar: Path | None,
     spmf_timeout_sec: int,
+    python_algo_timeout_sec: int | None,
 ) -> dict:
     suite_tag = "_".join(x for x in [tag, config.name] if x)
     records, output_paths = run_benchmark(
@@ -261,6 +262,7 @@ def _run_fim_suite(
         tag=suite_tag,
         spmf_jar=spmf_jar,
         spmf_timeout_sec=int(spmf_timeout_sec),
+        python_algo_timeout_sec=python_algo_timeout_sec,
         dataset_paths=dataset_paths,
         dataset_sep="auto",
         tx_columns=None,
@@ -972,6 +974,15 @@ def main() -> None:
         help="Path to SPMF JAR for FIM suite.",
     )
     parser.add_argument("--spmf-timeout-sec", type=int, default=300, help="Timeout per SPMF invocation.")
+    parser.add_argument(
+        "--python-algo-timeout-sec",
+        type=int,
+        default=600,
+        help=(
+            "Wall-clock cap (seconds) per in-process Python FIM algorithm call "
+            "(apyori, pyfim_*, mlxtend_*). Use 0 to disable. Default: 600."
+        ),
+    )
     parser.add_argument("--max-gpu-mem-mb", type=int, default=None, help="Optional GPU memory cap for bitset suite.")
     parser.add_argument(
         "--gpu-node-batch-size",
@@ -1070,6 +1081,9 @@ def main() -> None:
                 tag=args.tag,
                 spmf_jar=spmf_jar,
                 spmf_timeout_sec=max(1, int(args.spmf_timeout_sec)),
+                python_algo_timeout_sec=(
+                    None if int(args.python_algo_timeout_sec) <= 0 else int(args.python_algo_timeout_sec)
+                ),
             )
         )
 

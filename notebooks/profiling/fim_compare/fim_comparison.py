@@ -14,8 +14,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import importlib
 import json
+import multiprocessing as _mp
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 from time import perf_counter
 from typing import Callable, Iterable, Sequence
@@ -338,6 +340,89 @@ def _supports_for_candidates_cpu(
     return supports
 
 
+# Custom CUDA kernel that ANDs all item bitsets in an itemset and popcounts
+# the result, in one launch per chunk. Replaces 2*(k-1)+3 CuPy primitive
+# launches per chunk with a single launch, mirroring the action-rules
+# bitset_support_kernel_multi optimisation but adapted to FIM's
+# variable-length-itemset, single-output shape.
+_FIM_GPU_KERNEL = None
+_FIM_GPU_KERNEL_FAILED = False
+_FIM_GPU_KERNEL_MIN_WORK = 512  # chunk_size * num_words below this -> CuPy fallback
+
+
+def _get_fim_gpu_kernel():
+    """Lazily compile and cache the FIM batched support RawKernel."""
+    global _FIM_GPU_KERNEL, _FIM_GPU_KERNEL_FAILED
+    if _FIM_GPU_KERNEL is not None:
+        return _FIM_GPU_KERNEL
+    if _FIM_GPU_KERNEL_FAILED:
+        return None
+    try:
+        cp = importlib.import_module("cupy")
+    except Exception:
+        _FIM_GPU_KERNEL_FAILED = True
+        return None
+
+    code = r"""
+    extern "C" __global__
+    void bitset_fim_support_kernel(
+        const unsigned long long* item_masks,
+        const int* itemsets,
+        int items_per_set,
+        int num_words,
+        unsigned long long* out_support
+    ) {
+        extern __shared__ unsigned int shared_counts[];
+        const int work_index = blockIdx.x;
+        const int thread_id = threadIdx.x;
+        const int* set = itemsets + (size_t)work_index * (size_t)items_per_set;
+
+        unsigned int local_count = 0u;
+        for (int word_index = thread_id; word_index < num_words; word_index += blockDim.x) {
+            unsigned long long word = item_masks[(size_t)set[0] * (size_t)num_words + word_index];
+            for (int i = 1; i < items_per_set; i++) {
+                word &= item_masks[(size_t)set[i] * (size_t)num_words + word_index];
+            }
+            local_count += (unsigned int)__popcll(word);
+        }
+
+        shared_counts[thread_id] = local_count;
+        __syncthreads();
+
+        for (unsigned int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (thread_id < stride) {
+                shared_counts[thread_id] += shared_counts[thread_id + stride];
+            }
+            __syncthreads();
+        }
+
+        if (thread_id == 0) {
+            out_support[work_index] = (unsigned long long)shared_counts[0];
+        }
+    }
+    """
+    try:
+        _FIM_GPU_KERNEL = cp.RawKernel(code, "bitset_fim_support_kernel")
+    except Exception:
+        _FIM_GPU_KERNEL_FAILED = True
+        _FIM_GPU_KERNEL = None
+    return _FIM_GPU_KERNEL
+
+
+def _supports_for_chunk_via_cupy(cp, bit_masks, idx) -> "cp.ndarray":
+    """Fallback path: AND the per-item bitsets via CuPy primitives, then popcount."""
+    mask_batch = bit_masks[idx[:, 0]].copy()
+    for col in range(1, int(idx.shape[1])):
+        mask_batch &= bit_masks[idx[:, col]]
+    try:
+        return cp.bitwise_count(mask_batch).sum(axis=1, dtype=cp.uint64)
+    except Exception:
+        if hasattr(mask_batch, "bit_count"):
+            return mask_batch.bit_count().sum(axis=1, dtype=cp.uint64)  # type: ignore[call-arg]
+        counts_cpu = _popcount_uint64_rows(cp.asnumpy(mask_batch))
+        return cp.asarray(counts_cpu, dtype=cp.uint64)
+
+
 def _supports_for_candidates_gpu(
     bit_masks,
     itemsets: list[tuple[int, ...]],
@@ -354,24 +439,47 @@ def _supports_for_candidates_gpu(
     if chunk_size <= 0:
         chunk_size = len(itemsets)
 
+    num_words = int(bit_masks.shape[1])
+    items_per_set = len(itemsets[0])
+    kernel = _get_fim_gpu_kernel() if items_per_set >= 2 else None
+
     supports: list[int] = []
     for start in range(0, len(itemsets), chunk_size):
         chunk = itemsets[start : start + chunk_size]
+        chunk_len = len(chunk)
         idx_cpu = np.asarray(chunk, dtype=np.int32)
         idx = cp.asarray(idx_cpu, dtype=cp.int32)
-        mask_batch = bit_masks[idx[:, 0]].copy()
-        for col in range(1, int(idx.shape[1])):
-            mask_batch &= bit_masks[idx[:, col]]
-        try:
-            counts = cp.bitwise_count(mask_batch).sum(axis=1, dtype=cp.uint64)
-        except Exception:
-            if hasattr(mask_batch, "bit_count"):
-                counts = mask_batch.bit_count().sum(axis=1, dtype=cp.uint64)  # type: ignore[call-arg]
-            else:
-                counts_cpu = _popcount_uint64_rows(cp.asnumpy(mask_batch))
-                counts = cp.asarray(counts_cpu, dtype=cp.uint64)
-        counts_cpu = cp.asnumpy(counts).astype(np.int64, copy=False)
-        supports.extend(int(v) for v in counts_cpu.tolist())
+
+        used_kernel = False
+        if kernel is not None and chunk_len * num_words >= _FIM_GPU_KERNEL_MIN_WORK:
+            try:
+                idx_flat = cp.ascontiguousarray(idx)
+                out_support = cp.zeros(chunk_len, dtype=cp.uint64)
+                threads_per_block = 256
+                shared_bytes = threads_per_block * cp.dtype(cp.uint32).itemsize
+                kernel(
+                    (chunk_len,),
+                    (threads_per_block,),
+                    (
+                        bit_masks,
+                        idx_flat,
+                        np.int32(items_per_set),
+                        np.int32(num_words),
+                        out_support,
+                    ),
+                    shared_mem=shared_bytes,
+                )
+                counts_cpu = cp.asnumpy(out_support).astype(np.int64, copy=False)
+                supports.extend(int(v) for v in counts_cpu.tolist())
+                used_kernel = True
+            except Exception:
+                used_kernel = False
+
+        if not used_kernel:
+            counts = _supports_for_chunk_via_cupy(cp, bit_masks, idx)
+            counts_cpu = cp.asnumpy(counts).astype(np.int64, copy=False)
+            supports.extend(int(v) for v in counts_cpu.tolist())
+
     _sync_cupy_default_stream()
     return supports
 
@@ -642,6 +750,78 @@ def _run_bitset_fim_gpu(
         "rule_count": None,
         "itemset_count": int(itemset_count),
         "note": "itemsets_only=true",
+    }
+
+
+# ----------------------------------------------------------------------
+# Wall-clock timeout for in-process Python algorithms (apyori, pyfim,
+# mlxtend). On Linux uses fork so pandas/numpy/mlxtend imports are
+# inherited from the parent for free; on Windows uses spawn.
+# ----------------------------------------------------------------------
+
+def _algo_worker(conn, target_fn: Callable, kwargs: dict) -> None:
+    try:
+        result = target_fn(**kwargs)
+        conn.send({"ok": True, "result": result})
+    except BaseException as exc:  # noqa: BLE001 — must report any failure to parent
+        conn.send({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+    finally:
+        conn.close()
+
+
+def _run_with_timeout(
+    target_fn: Callable,
+    kwargs: dict,
+    timeout_sec: int | None,
+) -> dict:
+    """Run target_fn(**kwargs) in a subprocess with a wall-clock cap.
+
+    Returns target_fn's return dict on success, a status="timeout" dict if
+    the cap is exceeded, or status="error" if the worker crashed. Skips
+    the subprocess hop entirely when timeout_sec is None or non-positive.
+    """
+    if timeout_sec is None or int(timeout_sec) <= 0:
+        return target_fn(**kwargs)
+
+    start_method = "fork" if sys.platform != "win32" else "spawn"
+    ctx = _mp.get_context(start_method)
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_algo_worker, args=(child_conn, target_fn, kwargs))
+    proc.start()
+    child_conn.close()
+
+    proc.join(timeout=int(timeout_sec))
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        return {
+            "status": "timeout",
+            "elapsed_seconds": None,
+            "rule_count": None,
+            "itemset_count": None,
+            "note": f"Algorithm exceeded {int(timeout_sec)}s timeout.",
+        }
+
+    if parent_conn.poll():
+        msg = parent_conn.recv()
+        if msg.get("ok"):
+            return msg["result"]
+        return {
+            "status": "error",
+            "elapsed_seconds": None,
+            "rule_count": None,
+            "itemset_count": None,
+            "note": msg.get("error", "Worker raised an unspecified exception."),
+        }
+    return {
+        "status": "error",
+        "elapsed_seconds": None,
+        "rule_count": None,
+        "itemset_count": None,
+        "note": "Worker exited without producing output.",
     }
 
 
@@ -1073,6 +1253,7 @@ def run_benchmark(
     spmf_eclat_algo: str = "Eclat",
     cpp_fim_cmd: str = "",
     cpp_timeout_sec: int = 300,
+    python_algo_timeout_sec: int | None = 600,
     warmup_runs: int = 0,
     dataset_paths: list[Path] | None = None,
     dataset_path: Path = TELCO_PATH,
@@ -1218,46 +1399,66 @@ def run_benchmark(
                             max_len=max_len,
                         )
                     if algo == "apyori":
-                        return _run_apyori(
-                            transactions=transactions,
-                            min_support_count=effective_min_support_count,
-                            min_confidence=min_confidence,
-                            max_len=max_len,
-                            max_records=max_apyori_records,
+                        return _run_with_timeout(
+                            _run_apyori,
+                            dict(
+                                transactions=transactions,
+                                min_support_count=effective_min_support_count,
+                                min_confidence=min_confidence,
+                                max_len=max_len,
+                                max_records=max_apyori_records,
+                            ),
+                            python_algo_timeout_sec,
                         )
                     if algo == "pyfim_apriori":
-                        return _run_pyfim_itemsets(
-                            method_name="apriori",
-                            transactions=transactions,
-                            min_support_count=effective_min_support_count,
-                            max_len=max_len,
+                        return _run_with_timeout(
+                            _run_pyfim_itemsets,
+                            dict(
+                                method_name="apriori",
+                                transactions=transactions,
+                                min_support_count=effective_min_support_count,
+                                max_len=max_len,
+                            ),
+                            python_algo_timeout_sec,
                         )
                     if algo == "pyfim_eclat":
-                        return _run_pyfim_itemsets(
-                            method_name="eclat",
-                            transactions=transactions,
-                            min_support_count=effective_min_support_count,
-                            max_len=max_len,
+                        return _run_with_timeout(
+                            _run_pyfim_itemsets,
+                            dict(
+                                method_name="eclat",
+                                transactions=transactions,
+                                min_support_count=effective_min_support_count,
+                                max_len=max_len,
+                            ),
+                            python_algo_timeout_sec,
                         )
                     if algo == "mlxtend_apriori":
                         if mlxtend_onehot is None:
                             raise RuntimeError("Internal error: mlxtend one-hot frame was not prepared.")
-                        return _run_mlxtend_itemsets(
-                            method_name="apriori",
-                            onehot=mlxtend_onehot,
-                            min_support_count=effective_min_support_count,
-                            min_confidence=min_confidence,
-                            max_len=max_len,
+                        return _run_with_timeout(
+                            _run_mlxtend_itemsets,
+                            dict(
+                                method_name="apriori",
+                                onehot=mlxtend_onehot,
+                                min_support_count=effective_min_support_count,
+                                min_confidence=min_confidence,
+                                max_len=max_len,
+                            ),
+                            python_algo_timeout_sec,
                         )
                     if algo == "mlxtend_fpgrowth":
                         if mlxtend_onehot is None:
                             raise RuntimeError("Internal error: mlxtend one-hot frame was not prepared.")
-                        return _run_mlxtend_itemsets(
-                            method_name="fpgrowth",
-                            onehot=mlxtend_onehot,
-                            min_support_count=effective_min_support_count,
-                            min_confidence=min_confidence,
-                            max_len=max_len,
+                        return _run_with_timeout(
+                            _run_mlxtend_itemsets,
+                            dict(
+                                method_name="fpgrowth",
+                                onehot=mlxtend_onehot,
+                                min_support_count=effective_min_support_count,
+                                min_confidence=min_confidence,
+                                max_len=max_len,
+                            ),
+                            python_algo_timeout_sec,
                         )
                     if algo == "spmf_fpgrowth":
                         if external_input_path is None:
@@ -1464,6 +1665,15 @@ def main() -> None:
         help="Timeout in seconds for each external C++ baseline call.",
     )
     parser.add_argument(
+        "--python-algo-timeout-sec",
+        type=int,
+        default=600,
+        help=(
+            "Wall-clock cap (seconds) per in-process Python algorithm call "
+            "(apyori, pyfim_*, mlxtend_*). Use 0 to disable. Default: 600."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path(__file__).resolve().parent / "data",
@@ -1519,6 +1729,9 @@ def main() -> None:
         tag=args.tag,
         spmf_jar=args.spmf_jar,
         spmf_timeout_sec=args.spmf_timeout_sec,
+        python_algo_timeout_sec=(
+            None if int(args.python_algo_timeout_sec) <= 0 else int(args.python_algo_timeout_sec)
+        ),
         spmf_fpgrowth_algo=args.spmf_fpgrowth_algo,
         spmf_eclat_algo=args.spmf_eclat_algo,
         cpp_fim_cmd=args.cpp_fim_cmd,
