@@ -184,76 +184,6 @@ def _plot_algorithm_suite(
     return outputs
 
 
-def _plot_mode_summary(summary_path: Path, out_dir: Path, suite_name: str) -> list[Path]:
-    df = pd.read_csv(summary_path)
-    if df.empty:
-        return []
-
-    required = {"dataset_key", "mode_key", "mean_s"}
-    if not required.issubset(df.columns):
-        return []
-
-    outputs: list[Path] = []
-    pivot_mean = (
-        df.pivot_table(index="dataset_key", columns="mode_key", values="mean_s", aggfunc="mean")
-        .sort_index()
-    )
-    pivot_std = (
-        df.pivot_table(index="dataset_key", columns="mode_key", values="std_s", aggfunc="mean")
-        .reindex(index=pivot_mean.index, columns=pivot_mean.columns)
-        .fillna(0.0)
-    )
-
-    modes = list(pivot_mean.columns)
-    if len(modes) >= 2:
-        x = np.arange(len(pivot_mean.index))
-        width = min(0.36, 0.8 / len(modes))
-        fig, ax = plt.subplots(figsize=(10, 5))
-        bar_groups = []
-        for idx, mode in enumerate(modes):
-            offset = (idx - (len(modes) - 1) / 2.0) * width
-            means = pivot_mean[mode].fillna(0.0).to_numpy()
-            stds = pivot_std[mode].fillna(0.0).to_numpy()
-            bars = ax.bar(x + offset, means, width, yerr=stds, capsize=4, label=str(mode))
-            bar_groups.append((bars, means, stds))
-
-        title = "ActionRules CPU vs GPU runtime by dataset"
-        file_name = "bitset_cpu_vs_gpu_overview.png"
-
-        ax.set_title(title)
-        ax.set_xlabel("Dataset")
-        ax.set_ylabel("Mean elapsed seconds")
-        ax.set_xticks(x)
-        ax.set_xticklabels(list(pivot_mean.index), rotation=15)
-        ax.legend()
-        ax.grid(axis="y", alpha=0.3)
-
-        for bars, means, stds in bar_groups:
-            for bar, mean_s, std_s in zip(bars, means, stds):
-                ax.text(
-                    bar.get_x() + bar.get_width() / 2.0,
-                    bar.get_height(),
-                    f"{mean_s:.3f}s +/- {std_s:.3f}s",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                )
-
-        plt.tight_layout()
-        out_path = out_dir / file_name
-        plt.savefig(out_path, dpi=200)
-        plt.close(fig)
-        outputs.append(out_path)
-
-        speed = pivot_mean.reset_index()
-        if {"cpu", "gpu"}.issubset(speed.columns):
-            speed["cpu_over_gpu_speedup"] = speed["cpu"] / speed["gpu"]
-            speed_path = out_dir / "bitset_cpu_vs_gpu_speedup.csv"
-            speed.to_csv(speed_path, index=False)
-
-    return outputs
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plot comparison suite outputs.")
     parser.add_argument(
@@ -295,10 +225,8 @@ def main() -> None:
         if not summary_path.exists():
             print(f"Skipping {suite}: missing summary {summary_path}")
             continue
-        if suite in {"fim_itemsets", "rule_search"}:
+        if suite == "fim_itemsets":
             produced.extend(_plot_algorithm_suite(summary_path, suite, out_dir, raw_runs_path=raw_csv_path))
-        elif suite == "bitset_cpu_vs_gpu":
-            produced.extend(_plot_mode_summary(summary_path, out_dir, suite_name=suite))
 
     if not produced:
         print("No plots produced.")
