@@ -371,36 +371,26 @@ class ActionRules:
 
         Notes
         -----
-        Non-missing antecedent values are converted to strings while preserving NaNs, so missing stable/flexible
-        values are excluded from one-hot categories. The target attribute is converted to strings in full, then
-        all encoded blocks are concatenated into a single DataFrame.
+        All columns are cast to strings up front so missing values become the literal
+        string ``"nan"`` and participate in one-hot encoding like any other category.
+        This matches the upstream baseline's behaviour and keeps the resulting rule set
+        identical between snapshots regardless of whether the antecedent values are
+        missing.
         """
-        def _prepare_antecedent_frame(frame, attributes):
-            """
-            Convert non-missing antecedent values to strings while preserving NaNs.
-
-            Preserving missing values lets `get_dummies` skip them instead of creating
-            explicit `..._nan` categories. This mirrors the original ActionRulesDiscovery
-            preprocessing, which excludes NaN antecedent values before mining.
-            """
-            antecedent = frame[attributes].copy()
-            return antecedent.where(antecedent.isna(), antecedent.astype(str))
-
+        data = data.astype(str)
         to_concat = []
         if len(stable_attributes) > 0:
-            stable_frame = _prepare_antecedent_frame(data, stable_attributes)
             data_stable = self.pd.get_dummies(  # type: ignore
-                stable_frame, sparse=False, prefix_sep='_<item_stable>_'
+                data[stable_attributes], sparse=False, prefix_sep='_<item_stable>_'
             )
             to_concat.append(data_stable)
         if len(flexible_attributes) > 0:
-            flexible_frame = _prepare_antecedent_frame(data, flexible_attributes)
             data_flexible = self.pd.get_dummies(  # type: ignore
-                flexible_frame, sparse=False, prefix_sep='_<item_flexible>_'
+                data[flexible_attributes], sparse=False, prefix_sep='_<item_flexible>_'
             )
             to_concat.append(data_flexible)
         data_target = self.pd.get_dummies(  # type: ignore
-            data[[target]].astype(str), sparse=False, prefix_sep='_<item_target>_'
+            data[[target]], sparse=False, prefix_sep='_<item_target>_'
         )
         to_concat.append(data_target)
         data = self.pd.concat(to_concat, axis=1)  # type: ignore
