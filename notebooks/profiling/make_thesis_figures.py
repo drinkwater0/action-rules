@@ -169,18 +169,19 @@ def _fmt_seconds(t: float) -> str:
 def gpu_breakdown_figure() -> Path:
     # Numbers come straight from tab:gpu-time-breakdown in results.tex
     # (nsys stats --report=cuda_kern_exec_sum on a warm-start census_income fit).
+    wall_clock_ms = 919.0
     parts = [
-        ("Elementwise AND (cupy_bitwise_and)", 25.83, "#4477aa"),
-        ("Custom support kernel", 1.81, "#ee6677"),
-        ("Concatenation", 1.49, "#228833"),
-        ("One-shot setup", 1.32, "#ccbb44"),
+        ("CuPy bitmask AND", 25.83, "#4477aa"),
+        ("Custom bitmask AND + popcount", 1.81, "#ee6677"),
+        ("Kernel input assembly from queue", 1.49, "#228833"),
+        ("Bitmask upload + kernel JIT", 1.32, "#ccbb44"),
     ]
     labels = [p[0] for p in parts]
     sizes = [p[1] for p in parts]
     colors = [p[2] for p in parts]
     total = sum(sizes)
 
-    fig, ax = plt.subplots(figsize=(6.2, 3.6))
+    fig, ax = plt.subplots(figsize=(6.8, 3.6))
     wedges, _ = ax.pie(
         sizes,
         colors=colors,
@@ -200,7 +201,7 @@ def gpu_breakdown_figure() -> Path:
         else:
             x_in = math.cos(theta)
             y_in = math.sin(theta)
-            x_out = 1.35 * x_in
+            x_out = 1.55 * x_in
             y_out = 1.35 * y_in
             ha = "left" if x_in >= 0 else "right"
             ax.annotate(
@@ -215,16 +216,35 @@ def gpu_breakdown_figure() -> Path:
     ax.legend(
         wedges, labels,
         loc="center left",
-        bbox_to_anchor=(1.18, 0.5),
+        bbox_to_anchor=(1.18, 0.3),
         frameon=False,
         fontsize=8,
     )
+    context_ax = ax.inset_axes([1.2, 0.5, 0.34, 0.34])
+    context_sizes = [total, wall_clock_ms - total]
+    context_ax.pie(
+        context_sizes,
+        colors=["#222222", "#dddddd"],
+        startangle=90,
+        counterclock=False,
+        wedgeprops=dict(edgecolor="white", linewidth=0.5),
+    )
+    
+    context_ax.set_title(
+        f"GPU time in fit()\n"
+        f"(total $\\approx$ {total:.1f} ms of a {wall_clock_ms:.0f} ms fit)", fontsize=7, pad=1
+    )
+    context_ax.text(
+        0, 0, f"{total:.0f} ms\n{total / wall_clock_ms * 100:.1f} %",
+        ha="center", va="center", fontsize=6,
+    )
+    context_ax.set_aspect("equal")
     ax.set_title(
-        f"GPU exec time per kernel category\n"
-        f"(total $\\approx$ {total:.1f} ms of a 919 ms fit)"
+        f"GPU time per kernel category\n"
+        
     )
     ax.set_xlim(-1.6, 1.6)
-    ax.set_ylim(-1.3, 1.4)
+    ax.set_ylim(-1.45, 1.4)
 
     out = OUT_DIR / "results-gpu-time-breakdown.pdf"
     fig.savefig(out, bbox_inches="tight")
@@ -233,15 +253,14 @@ def gpu_breakdown_figure() -> Path:
 
 
 def commit_evolution_figure() -> Path:
-    src = REPO_ROOT / "notebooks/profiling/commit_benchmarks/results/commit_benchmarks_20260505T150639Z.csv"
+    src = REPO_ROOT / "notebooks/profiling/commit_benchmarks/results/commit_benchmarks_20260509T202029Z.csv"
     df = pd.read_csv(src)
 
     snapshot_order = [
         "baseline",
         "first_bitset_cpu",
         "batch_support_counting",
-        "final_cpu",
-        "final_gpu",
+        "final",
         "gpu_prefix_only",
         "gpu_carryover",
     ]
@@ -249,55 +268,69 @@ def commit_evolution_figure() -> Path:
         "baseline": "baseline",
         "first_bitset_cpu": "first bitset",
         "batch_support_counting": "batch support",
-        "final_cpu": "final CPU",
-        "final_gpu": "final GPU",
+        "final": "final CPU",
         "gpu_prefix_only": "GPU prefix-\nonly",
         "gpu_carryover": "GPU carryover\n(current)",
     }
+    backend_style = {"cpu": "-", "gpu": "--"}
 
     fig, ax = plt.subplots(figsize=(7.4, 3.8))
     x_positions = list(range(len(snapshot_order)))
 
-    timeout_points = []  # (snapshot_idx, dataset)
+    timeout_points = []  # (snapshot_idx, dataset, backend)
     for ds in DATASET_ORDER:
-        sub = df[df["dataset"] == ds].set_index("snapshot").reindex(snapshot_order)
-        ys = []
-        yerrs = []
-        for i, snap in enumerate(snapshot_order):
-            row = sub.loc[snap]
-            if row["status"] == "ok":
-                ys.append(row["fit_mean_s"] * 1000)
-                yerrs.append(row["fit_std_s"] * 1000)
-            else:
-                ys.append(float("nan"))
-                yerrs.append(float("nan"))
-                timeout_points.append((i, ds))
-        ax.errorbar(
-            x_positions, ys, yerr=yerrs,
-            marker="o", label=DATASET_LABEL[ds],
-            color=DATASET_COLOR[ds], capsize=3, linewidth=1.4,
-        )
+        for backend in ("cpu", "gpu"):
+            sub = (df[(df["dataset"] == ds) & (df["backend"] == backend)]
+                   .set_index("snapshot").reindex(snapshot_order))
+            ys, yerrs = [], []
+            for i, snap in enumerate(snapshot_order):
+                row = sub.loc[snap]
+                if row["status"] == "ok":
+                    ys.append(row["fit_mean_s"] * 1000)
+                    yerrs.append(row["fit_std_s"] * 1000)
+                else:
+                    ys.append(float("nan"))
+                    yerrs.append(float("nan"))
+                    timeout_points.append((i, ds, backend))
+            ax.errorbar(
+                x_positions, ys, yerr=yerrs,
+                marker="o", color=DATASET_COLOR[ds],
+                linestyle=backend_style[backend],
+                capsize=3, linewidth=1.4,
+            )
 
     ax.set_xticks(x_positions)
     ax.set_xticklabels([snapshot_short[s] for s in snapshot_order], fontsize=8)
     ax.set_ylabel("Mean fit time (ms)")
     ax.set_xlabel("Implementation snapshot")
     ax.grid(axis="y", which="both", linestyle=":", linewidth=0.6, alpha=0.7)
-    ax.legend(loc="upper right", framealpha=0.9)
     ax.set_ylim(0, 7500)
 
-    # Mark timeouts at top of axis with the dataset's colour and a label.
+    # Two legends: dataset (color) and backend (linestyle).
+    from matplotlib.lines import Line2D
+    dataset_handles = [
+        Line2D([0], [0], color=DATASET_COLOR[ds], linewidth=1.6,
+               marker="o", label=DATASET_LABEL[ds])
+        for ds in DATASET_ORDER
+    ]
+    backend_handles = [
+        Line2D([0], [0], color="black", linestyle="-", linewidth=1.4, label="CPU"),
+        Line2D([0], [0], color="black", linestyle="--", linewidth=1.4, label="GPU"),
+    ]
+    leg1 = ax.legend(handles=dataset_handles, loc="upper right", framealpha=0.9)
+    ax.add_artist(leg1)
+    ax.legend(handles=backend_handles, loc="upper right",
+              bbox_to_anchor=(1.0, 0.78), framealpha=0.9, fontsize=8)
+
+    # Mark timeouts at top of axis with the dataset's colour. No red edge.
     y_to = ax.get_ylim()[1] * 0.95
-    seen_label = False
-    for x, ds in timeout_points:
+    for x, ds, _backend in timeout_points:
         ax.scatter(x, y_to, marker="X", color=DATASET_COLOR[ds],
-                   edgecolor="#a00", s=70, linewidth=1.0, zorder=5,
-                   label=("timeout" if not seen_label else None))
-        seen_label = True
+                   s=70, linewidth=0, zorder=5)
     if timeout_points:
         ax.text(timeout_points[0][0], y_to * 0.92,
-                "timeout (60 s cap)",
-                ha="left", va="top", fontsize=7, color="#a00")
+                "timeout (900 s cap)",
+                ha="left", va="top", fontsize=7, color="#444")
 
     fig.tight_layout()
     out = OUT_DIR / "results-commit-evolution.pdf"
@@ -306,31 +339,49 @@ def commit_evolution_figure() -> Path:
     return out
 
 
-def commit_memory_bars_figure() -> Path:
-    src = REPO_ROOT / "notebooks/profiling/commit_benchmarks/results/commit_benchmarks_20260508T131905Z_peak_memory.csv"
+def commit_memory_bars_figure() -> Path | None:
+    # Memory is measured in a separate run from speed (instrumentation slows
+    # the fit too much to share a CSV). Update this path when the new peak-
+    # memory CSV is dropped into results/.
+    src = REPO_ROOT / "notebooks/profiling/commit_benchmarks/results/commit_benchmarks_20260509T232723Z_peak_memory.csv"
+    if not src.exists():
+        print(f"skipped commit_memory_bars_figure: {src.name} not found")
+        return None
     df = pd.read_csv(src)
 
-    snapshots = [
-        "baseline",
-        "first_bitset_cpu",
-        "batch_support_counting",
-        "gpu_prefix_only",
-        "gpu_carryover",
+    # Per-snapshot backend pick: CPU snapshots have no VRAM column populated,
+    # so we read their host-RSS row from the CPU run; GPU snapshots come from
+    # the GPU run so peak_used_mb is meaningful.
+    snapshot_specs = [
+        ("baseline",               "cpu", "baseline"),
+        ("first_bitset_cpu",       "cpu", "first bitset"),
+        ("batch_support_counting", "cpu", "batch support"),
+        ("gpu_prefix_only",        "gpu", "GPU prefix-only"),
+        ("gpu_carryover",          "gpu", "GPU carryover"),
     ]
-    snapshot_short = {
-        "baseline": "baseline",
-        "first_bitset_cpu": "first bitset",
-        "batch_support_counting": "batch support",
-        "gpu_prefix_only": "GPU prefix-only",
-        "gpu_carryover": "GPU carryover",
-    }
+    snapshots = [s for s, _, _ in snapshot_specs]
+    snapshot_short = {s: short for s, _, short in snapshot_specs}
     dataset = "adult"
-    sub = df[df["dataset"] == dataset].set_index("snapshot").reindex(snapshots)
 
-    rss = [float(sub.loc[s, "peak_host_rss_delta_mb"]) if sub.loc[s, "status"] == "ok" else 0.0
-           for s in snapshots]
-    vram = [float(sub.loc[s, "peak_used_mb"]) if sub.loc[s, "status"] == "ok" else 0.0
-            for s in snapshots]
+    keyed = df.set_index(["snapshot", "backend", "dataset"])
+
+    def _row(snap: str, backend: str):
+        try:
+            return keyed.loc[(snap, backend, dataset)]
+        except KeyError:
+            return None
+
+    rss: list[float] = []
+    vram: list[float] = []
+    for snap, backend, _ in snapshot_specs:
+        row = _row(snap, backend)
+        if row is None or row["status"] != "ok":
+            rss.append(0.0)
+            vram.append(0.0)
+            continue
+        rss.append(float(row["peak_host_rss_delta_mb"]))
+        v = row["peak_used_mb"]
+        vram.append(float(v) if pd.notna(v) else 0.0)
 
     fig, (ax_top, ax_bot) = plt.subplots(
         2, 1, sharex=True, figsize=(6.4, 3.8),
@@ -341,9 +392,9 @@ def commit_memory_bars_figure() -> Path:
 
     for ax in (ax_top, ax_bot):
         ax.bar([xi - width / 2 for xi in x], rss, width,
-               label="Host RSS growth", color="#4477aa", edgecolor="black", linewidth=0.4)
+               label="Peak RAM", color="#4477aa", edgecolor="black", linewidth=0.4)
         ax.bar([xi + width / 2 for xi in x], vram, width,
-               label="Peak live VRAM", color="#ee6677", edgecolor="black", linewidth=0.4)
+               label="Peak VRAM", color="#ee6677", edgecolor="black", linewidth=0.4)
 
     bot_top_limit = 380
     ax_top.set_ylim(2250, 2400)
@@ -367,7 +418,7 @@ def commit_memory_bars_figure() -> Path:
     ax_bot.set_ylabel("Memory (MB)")
     ax_bot.yaxis.set_label_coords(-0.08, 0.6)
     ax_bot.set_xlabel("Implementation snapshot")
-    ax_top.set_title(f"Peak host RSS growth vs peak VRAM ({dataset})")
+    ax_top.set_title(f"Peak RAM vs VRAM ({dataset})")
     for ax in (ax_top, ax_bot):
         ax.grid(axis="y", which="both", linestyle=":", linewidth=0.5, alpha=0.6)
     ax_bot.legend(loc="upper right", framealpha=0.9, fontsize=8)
@@ -400,7 +451,8 @@ def main() -> None:
                gpu_breakdown_figure, commit_evolution_figure,
                commit_memory_bars_figure):
         out = fn()
-        print(f"wrote {out.relative_to(REPO_ROOT)}")
+        if out is not None:
+            print(f"wrote {out.relative_to(REPO_ROOT)}")
 
 
 if __name__ == "__main__":
