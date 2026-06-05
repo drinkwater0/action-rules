@@ -405,13 +405,66 @@ class CandidateGenerator:
         stop_list: list,
         stop_list_itemset: list,
     ) -> Optional[list]:
+        """
+        Expand a batch of candidates in one GPU support pass.
+
+        Returns the new branches, or None to signal the caller to retry the
+        batch on the sequential CPU path.
+        """
         try:
             import cupy as cp
         except ImportError:
             return None
 
-        work_candidate_indices = []
-        work_item_indices = []
+        work_candidate_indices, work_item_indices = self._collect_gpu_worklist(
+            batch_contexts, stop_list, stop_list_itemset
+        )
+        if not work_item_indices:
+            return []
+
+        branch_masks = self._stack_branch_masks(cp, batch_contexts)
+        if branch_masks is None:
+            return None
+
+        supports = self._gpu_bitset_support_batch_multi(
+            branch_masks[0],
+            branch_masks[1],
+            work_candidate_indices,
+            work_item_indices,
+        )
+        if supports is None:
+            return None
+        undesired_supports_all, desired_supports_all = supports
+
+        new_branches_all = []
+        for context in batch_contexts:
+            new_branches = self._expand_stable_slices(
+                context, undesired_supports_all, desired_supports_all, stop_list
+            )
+            new_branches += self._expand_flex_slices(
+                context, undesired_supports_all, desired_supports_all, stop_list, stop_list_itemset
+            )
+            self.update_new_branches(
+                new_branches, context["stable_candidates"], context["flexible_candidates"]
+            )
+            new_branches_all.extend(new_branches)
+
+        return new_branches_all
+
+    def _collect_gpu_worklist(
+        self,
+        batch_contexts: list,
+        stop_list: list,
+        stop_list_itemset: list,
+    ) -> tuple[list, list]:
+        """
+        Flatten active stable/flexible items across the batch into one worklist.
+
+        Each context records its `stable_slices`/`flex_slices` (attribute, items,
+        start offset) so kernel results can be scattered back per context.
+        """
+        work_candidate_indices: list = []
+        work_item_indices: list = []
         for ctx_index, context in enumerate(batch_contexts):
             context["stable_slices"] = []
             context["flex_slices"] = []
@@ -435,145 +488,143 @@ class CandidateGenerator:
                 work_item_indices.extend(active_items)
                 work_candidate_indices.extend([ctx_index] * len(active_items))
                 context["flex_slices"].append((attribute, active_items, start))
+        return work_candidate_indices, work_item_indices
 
-        if not work_item_indices:
-            return []
-
+    @staticmethod
+    def _stack_branch_masks(cp, batch_contexts: list) -> Optional[tuple]:
+        """Stack per-context packed masks into 2D arrays; None if stacking fails."""
         try:
             branch_masks_a = cp.stack(
-                [
-                    cp.asarray(context["bitset_undesired_mask"], dtype=cp.uint64).reshape(-1)
-                    for context in batch_contexts
-                ],
+                [cp.asarray(c["bitset_undesired_mask"], dtype=cp.uint64).reshape(-1) for c in batch_contexts],
                 axis=0,
             )
             branch_masks_b = cp.stack(
-                [
-                    cp.asarray(context["bitset_desired_mask"], dtype=cp.uint64).reshape(-1)
-                    for context in batch_contexts
-                ],
+                [cp.asarray(c["bitset_desired_mask"], dtype=cp.uint64).reshape(-1) for c in batch_contexts],
                 axis=0,
             )
         except Exception:
             return None
+        return branch_masks_a, branch_masks_b
 
-        supports = self._gpu_bitset_support_batch_multi(
-            branch_masks_a,
-            branch_masks_b,
-            work_candidate_indices,
-            work_item_indices,
-        )
-        if supports is None:
-            return None
-
-        new_branches_all = []
-        undesired_supports_all, desired_supports_all = supports
-        for context in batch_contexts:
-            new_branches = []
-            stable_candidates = context["stable_candidates"]
-            flexible_candidates = context["flexible_candidates"]
-
-            for attribute, items, start in context["stable_slices"]:
-                for offset, item in enumerate(items):
-                    new_ar_prefix = context["ar_prefix"] + (item,)
-                    if self.in_stop_list(new_ar_prefix, stop_list):
-                        continue
-                    index = start + offset
-                    undesired_support = undesired_supports_all[index]
-                    desired_support = desired_supports_all[index]
-                    if undesired_support < self.min_undesired_support or desired_support < self.min_desired_support:
-                        stable_candidates[attribute].remove(item)
-                        self._add_stop_entry(stop_list, new_ar_prefix)
-                    else:
-                        new_branches.append(
-                            {
-                                "ar_prefix": new_ar_prefix,
-                                "itemset_prefix": new_ar_prefix,
-                                "item": item,
-                                "actionable_attributes": 0,
-                                "parent_undesired_mask": context["bitset_undesired_mask"],
-                                "parent_desired_mask": context["bitset_desired_mask"],
-                            }
-                        )
-
-            for attribute, items, start in context["flex_slices"]:
-                new_ar_prefix = context["ar_prefix"] + (attribute,)
+    def _expand_stable_slices(
+        self,
+        context: dict,
+        undesired_supports_all: list,
+        desired_supports_all: list,
+        stop_list: list,
+    ) -> list:
+        """Turn kernel supports for stable items into new branches / stop entries."""
+        new_branches: list = []
+        stable_candidates = context["stable_candidates"]
+        for attribute, items, start in context["stable_slices"]:
+            for offset, item in enumerate(items):
+                new_ar_prefix = context["ar_prefix"] + (item,)
                 if self.in_stop_list(new_ar_prefix, stop_list):
                     continue
-                undesired_states = []
-                desired_states = []
-                undesired_count = 0
-                desired_count = 0
-                kept_items = []
-                for offset, item in enumerate(items):
-                    if self.in_stop_list(context["itemset_prefix"] + (item,), stop_list_itemset):
-                        continue
-                    index = start + offset
-                    undesired_support = undesired_supports_all[index]
-                    desired_support = desired_supports_all[index]
-
-                    undesired_conf = self.rules.calculate_confidence(undesired_support, desired_support)
-                    if undesired_support >= self.min_undesired_support:
-                        undesired_count += 1
-                        if undesired_conf >= self.min_undesired_confidence:
-                            undesired_states.append(
-                                {
-                                    "item": item,
-                                    "support": undesired_support,
-                                    "confidence": undesired_conf,
-                                }
-                            )
-                        else:
-                            self.rules.add_prefix_without_conf(new_ar_prefix, False)
-
-                    desired_conf = self.rules.calculate_confidence(desired_support, undesired_support)
-                    if desired_support >= self.min_desired_support:
-                        desired_count += 1
-                        if desired_conf >= self.min_desired_confidence:
-                            desired_states.append(
-                                {
-                                    "item": item,
-                                    "support": desired_support,
-                                    "confidence": desired_conf,
-                                }
-                            )
-                        else:
-                            self.rules.add_prefix_without_conf(new_ar_prefix, True)
-
-                    if desired_support < self.min_desired_support and undesired_support < self.min_undesired_support:
-                        flexible_candidates[attribute].remove(item)
-                        self._add_stop_entry(stop_list_itemset, context["itemset_prefix"] + (item,))
-                        continue
-
-                    kept_items.append(item)
-
-                if context["actionable_attributes"] == 0 and (undesired_count == 0 or desired_count == 0):
-                    del flexible_candidates[attribute]
-                    self._add_stop_entry(stop_list, context["ar_prefix"] + (attribute,))
+                index = start + offset
+                undesired_support = undesired_supports_all[index]
+                desired_support = desired_supports_all[index]
+                if undesired_support < self.min_undesired_support or desired_support < self.min_desired_support:
+                    stable_candidates[attribute].remove(item)
+                    self._add_stop_entry(stop_list, new_ar_prefix)
                 else:
-                    for item in kept_items:
-                        new_branches.append(
+                    new_branches.append(
+                        {
+                            "ar_prefix": new_ar_prefix,
+                            "itemset_prefix": new_ar_prefix,
+                            "item": item,
+                            "actionable_attributes": 0,
+                            "parent_undesired_mask": context["bitset_undesired_mask"],
+                            "parent_desired_mask": context["bitset_desired_mask"],
+                        }
+                    )
+        return new_branches
+
+    def _expand_flex_slices(
+        self,
+        context: dict,
+        undesired_supports_all: list,
+        desired_supports_all: list,
+        stop_list: list,
+        stop_list_itemset: list,
+    ) -> list:
+        """Turn kernel supports for flexible items into new branches and classification rules."""
+        new_branches: list = []
+        flexible_candidates = context["flexible_candidates"]
+        for attribute, items, start in context["flex_slices"]:
+            new_ar_prefix = context["ar_prefix"] + (attribute,)
+            if self.in_stop_list(new_ar_prefix, stop_list):
+                continue
+            undesired_states = []
+            desired_states = []
+            undesired_count = 0
+            desired_count = 0
+            kept_items = []
+            for offset, item in enumerate(items):
+                if self.in_stop_list(context["itemset_prefix"] + (item,), stop_list_itemset):
+                    continue
+                index = start + offset
+                undesired_support = undesired_supports_all[index]
+                desired_support = desired_supports_all[index]
+
+                undesired_conf = self.rules.calculate_confidence(undesired_support, desired_support)
+                if undesired_support >= self.min_undesired_support:
+                    undesired_count += 1
+                    if undesired_conf >= self.min_undesired_confidence:
+                        undesired_states.append(
                             {
-                                "ar_prefix": new_ar_prefix,
-                                "itemset_prefix": context["itemset_prefix"] + (item,),
                                 "item": item,
-                                "actionable_attributes": context["actionable_attributes"] + 1,
-                                "parent_undesired_mask": context["bitset_undesired_mask"],
-                                "parent_desired_mask": context["bitset_desired_mask"],
+                                "support": undesired_support,
+                                "confidence": undesired_conf,
                             }
                         )
-                    if context["actionable_attributes"] + 1 >= self.min_flexible_attributes:
-                        self.rules.add_classification_rules(
-                            new_ar_prefix,
-                            context["itemset_prefix"],
-                            undesired_states,
-                            desired_states,
+                    else:
+                        self.rules.add_prefix_without_conf(new_ar_prefix, False)
+
+                desired_conf = self.rules.calculate_confidence(desired_support, undesired_support)
+                if desired_support >= self.min_desired_support:
+                    desired_count += 1
+                    if desired_conf >= self.min_desired_confidence:
+                        desired_states.append(
+                            {
+                                "item": item,
+                                "support": desired_support,
+                                "confidence": desired_conf,
+                            }
                         )
+                    else:
+                        self.rules.add_prefix_without_conf(new_ar_prefix, True)
 
-            self.update_new_branches(new_branches, stable_candidates, flexible_candidates)
-            new_branches_all.extend(new_branches)
+                if desired_support < self.min_desired_support and undesired_support < self.min_undesired_support:
+                    flexible_candidates[attribute].remove(item)
+                    self._add_stop_entry(stop_list_itemset, context["itemset_prefix"] + (item,))
+                    continue
 
-        return new_branches_all
+                kept_items.append(item)
+
+            if context["actionable_attributes"] == 0 and (undesired_count == 0 or desired_count == 0):
+                del flexible_candidates[attribute]
+                self._add_stop_entry(stop_list, context["ar_prefix"] + (attribute,))
+            else:
+                for item in kept_items:
+                    new_branches.append(
+                        {
+                            "ar_prefix": new_ar_prefix,
+                            "itemset_prefix": context["itemset_prefix"] + (item,),
+                            "item": item,
+                            "actionable_attributes": context["actionable_attributes"] + 1,
+                            "parent_undesired_mask": context["bitset_undesired_mask"],
+                            "parent_desired_mask": context["bitset_desired_mask"],
+                        }
+                    )
+                if context["actionable_attributes"] + 1 >= self.min_flexible_attributes:
+                    self.rules.add_classification_rules(
+                        new_ar_prefix,
+                        context["itemset_prefix"],
+                        undesired_states,
+                        desired_states,
+                    )
+        return new_branches
 
     @staticmethod
     def _add_stop_entry(stop_collection, value: tuple) -> None:

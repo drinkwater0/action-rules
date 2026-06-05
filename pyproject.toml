@@ -1,7 +1,7 @@
 [tool]
 [tool.poetry]
 name = "action-rules"
-version = "1.0.11"
+version = "2.0.0"
 homepage = "https://github.com/lukassykora/action-rules"
 description = "The package for action rules mining using Action-Apriori (Apriori Modified for Action Rules Mining).."
 authors = ["Lukas Sykora <lukas.sykora@vse.cz>"]
@@ -17,6 +17,13 @@ classifiers=[
 packages = [
     { include = "action_rules",  from = "src"},
     { include = "tests", format = "sdist" },
+]
+# Benchmark-support modules live in the source tree so the profiling harness in
+# notebooks/profiling stays runnable, but they are not part of the published core.
+exclude = [
+    "src/action_rules/profiling.py",
+    "src/action_rules/autotuning.py",
+    "src/action_rules/gpu_warmup.py",
 ]
 
 [tool.poetry.dependencies]

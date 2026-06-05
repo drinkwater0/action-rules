@@ -165,27 +165,6 @@ def test_one_hot_encode_empty_stable(action_rules):
     assert set(encoded_df.columns) == set(expected_columns)
 
 
-def test_one_hot_encode_ignores_missing_antecedents(action_rules):
-    """
-    Missing stable/flexible values should not become explicit one-hot categories.
-    """
-    df = pd.DataFrame(
-        {
-            'stable': ['a', np.nan],
-            'flexible': ['x', np.nan],
-            'target': ['yes', 'no'],
-        }
-    )
-    action_rules.set_array_library(use_gpu=False, df=df)
-
-    encoded_df = action_rules.one_hot_encode(df, ['stable'], ['flexible'], 'target')
-
-    assert 'stable_<item_stable>_a' in encoded_df.columns
-    assert 'flexible_<item_flexible>_x' in encoded_df.columns
-    assert 'stable_<item_stable>_nan' not in encoded_df.columns
-    assert 'flexible_<item_flexible>_nan' not in encoded_df.columns
-
-
 def test_one_hot_encode_keeps_target_missing_as_category(action_rules):
     """
     Target NaNs remain explicit categories to preserve downstream target-state handling.

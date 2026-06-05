@@ -404,10 +404,12 @@ class ActionRules:
         target: dict,
         target_undesired_state: str,
         target_desired_state: str,
+        use_sparse_matrix: bool = False,
         use_gpu: bool = False,
         max_gpu_mem_mb: Optional[int] = None,
         gpu_node_batch_size: Optional[int] = None,
         gpu_batch_size: Optional[int] = None,
+        **kwargs,
     ):
         """
         Fit the model when input data is already one-hot encoded.
@@ -433,6 +435,11 @@ class ActionRules:
             The undesired state of the target attribute, used in action rule generation.
         target_desired_state : str
             The desired state of the target attribute, used in action rule generation.
+        use_sparse_matrix : bool, optional
+            Kept for backward compatibility with action-rules <= 1.0.11. The bitset
+            backend supersedes sparse matrices, so this flag is accepted and ignored.
+            Other unrecognized keyword arguments (``**kwargs``) are likewise accepted
+            and ignored for backward compatibility with older call signatures.
         use_gpu : bool, optional
             If True, the GPU (cuDF) is used for data processing if available.
             Default is False.
@@ -490,9 +497,10 @@ class ActionRules:
             attribute_target,
             target_undesired_state,
             target_desired_state,
-            use_gpu,
-            max_gpu_mem_mb,
-            gpu_node_batch_size,
+            use_sparse_matrix=use_sparse_matrix,
+            use_gpu=use_gpu,
+            max_gpu_mem_mb=max_gpu_mem_mb,
+            gpu_node_batch_size=gpu_node_batch_size,
         )
 
     def fit(
@@ -503,10 +511,12 @@ class ActionRules:
         target: str,
         target_undesired_state: str,
         target_desired_state: str,
-        use_gpu: Union[bool, str] = False,
+        use_sparse_matrix: bool = False,
+        use_gpu: bool = False,
         max_gpu_mem_mb: Optional[int] = None,
         gpu_node_batch_size: Optional[int] = None,
         gpu_batch_size: Optional[int] = None,
+        **kwargs,
     ):
         """
         Generate action rules for the provided dataset.
@@ -525,10 +535,13 @@ class ActionRules:
             The undesired state of the target attribute.
         target_desired_state : str
             The desired state of the target attribute.
-        use_gpu : bool or str, optional
-            Use GPU (cuDF) for data processing if available. Pass ``'auto'``
-            to profile the dataset and select the fastest backend
-            automatically via sampled trial runs. Default is False.
+        use_sparse_matrix : bool, optional
+            Kept for backward compatibility with action-rules <= 1.0.11. The bitset
+            backend supersedes sparse matrices, so this flag is accepted and ignored.
+            Other unrecognized keyword arguments (``**kwargs``) are likewise accepted
+            and ignored for backward compatibility with older call signatures.
+        use_gpu : bool, optional
+            Use GPU (cuDF) for data processing if available. Default is False.
         max_gpu_mem_mb : int, optional
             Optional GPU memory cap (in MB) for CuPy allocations and bitset
             support batching. If None, automatic memory-based chunking is used.
@@ -554,76 +567,16 @@ class ActionRules:
             gpu_node_batch_size = gpu_batch_size
         elif gpu_batch_size is not None and int(gpu_node_batch_size) != int(gpu_batch_size):
             raise ValueError("gpu_node_batch_size and gpu_batch_size must match when both are provided.")
-
-        # Start GPU warmup early so CuPy import + RawKernel JIT overlap with
-        # the CPU prep below (one-hot encode, bit-mask construction). Idempotent
-        # across fit() calls in the same process.
-        from .gpu_warmup import start_gpu_warmup_async, ensure_gpu_warmup_done
-        _maybe_uses_gpu = (use_gpu is True) or (
-            isinstance(use_gpu, str) and use_gpu.lower() == "auto"
-        )
-        start_gpu_warmup_async(
-            min_stable_attributes=self.min_stable_attributes,
-            min_flexible_attributes=self.min_flexible_attributes,
-            stable_attributes=stable_attributes,
-            flexible_attributes=flexible_attributes,
-            target=target,
-            target_undesired_state=target_undesired_state,
-            target_desired_state=target_desired_state,
-            use_gpu=_maybe_uses_gpu,
-        )
-
-        # --- Auto backend selection via profiling + sampled autotuning ----
-        if use_gpu == "auto":
-            from .autotuning import autotune
-            from .profiling import profile_dataset
-
-            # Profile on a temporary instance so self stays clean for the
-            # real fit that follows.
-            profile_helper = ActionRules(
-                min_stable_attributes=self.min_stable_attributes,
-                min_flexible_attributes=self.min_flexible_attributes,
-                min_undesired_support=self.min_undesired_support,
-                min_undesired_confidence=self.min_undesired_confidence,
-                min_desired_support=self.min_desired_support,
-                min_desired_confidence=self.min_desired_confidence,
-                verbose=False,
-            )
-            dataset_profile = profile_dataset(
-                action_rules=profile_helper,
-                data_frame=data,
-                stable_attributes=stable_attributes,
-                flexible_attributes=flexible_attributes,
-                target=target,
-            )
-            best = autotune(
-                action_rules_cls=ActionRules,
-                data_frame=data,
-                stable_attributes=stable_attributes,
-                flexible_attributes=flexible_attributes,
-                target=target,
-                target_undesired_state=target_undesired_state,
-                target_desired_state=target_desired_state,
-                min_stable_attributes=self.min_stable_attributes,
-                min_flexible_attributes=self.min_flexible_attributes,
-                min_undesired_support=self.min_undesired_support,
-                min_undesired_confidence=self.min_undesired_confidence,
-                min_desired_support=self.min_desired_support,
-                min_desired_confidence=self.min_desired_confidence,
-                dataset_profile=dataset_profile,
-                max_gpu_mem_mb=max_gpu_mem_mb,
-                gpu_node_batch_size=gpu_node_batch_size,
-            )
-            use_gpu = best["use_gpu"]
-            gpu_node_batch_size = best.get("gpu_node_batch_size")
-            self._autotune_result = best
-            self._dataset_profile = dataset_profile
+        # Forward tolerance: legacy callers passed use_gpu="auto" for backend
+        # autoselection. That harness lives outside the package now, so treat any
+        # truthy string as a plain GPU request instead of raising.
+        if isinstance(use_gpu, str):
+            use_gpu = use_gpu.strip().lower() not in ("", "false", "cpu", "no", "0")
 
         # reset cached bitset structures before fitting a new model
         self.bit_masks = None
         self.target_state_bit_masks = None
         self.frames_bit_masks = None
-        ensure_gpu_warmup_done(bool(use_gpu))
         self.set_array_library(use_gpu, data)
         previous_gpu_pool_limit = None
         if not self.is_onehot:

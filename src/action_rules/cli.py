@@ -177,7 +177,7 @@ def main(
         str(target),
         str(undesired_state),
         str(desired_state),
-        use_gpu,
+        use_gpu=use_gpu,
     )
     rules = action_rules.get_rules()
     if rules is not None:
