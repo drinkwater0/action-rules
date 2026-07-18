@@ -313,13 +313,23 @@ class ActionRules:
         else:
             padded_data = data
 
-        # Group transactions into 64-bit chunks: (num_attributes, num_words, 64).
-        chunks = padded_data.reshape(num_attributes, num_words, 64).astype(self.np.uint64, copy=False)
         bit_offsets = self.np.arange(64, dtype=self.np.uint64)
         bit_weights = self.np.left_shift(self.np.uint64(1), bit_offsets)
 
-        # Pack each 64-sized transaction chunk into one uint64 word.
-        bit_masks = self.np.tensordot(chunks, bit_weights, axes=([2], [0])).astype(self.np.uint64, copy=False)
+        # Pack each 64-sized transaction chunk into one uint64 word. CuPy has no
+        # integer GEMM, so uint64 tensordot falls back to a kernel whose grid
+        # scales with num_attributes * num_words; past ~5M that launch fails with
+        # CUDA_ERROR_INVALID_VALUE (observed at 10M rows on an L40S, fine at
+        # 3.16M). Pack one attribute at a time on GPU so every launch stays small;
+        # NumPy has no such limit, so the CPU path keeps the vectorized tensordot.
+        if self.is_gpu_np:
+            bit_masks = self.np.empty((num_attributes, num_words), dtype=self.np.uint64)
+            for i in range(num_attributes):
+                chunk = padded_data[i].reshape(num_words, 64).astype(self.np.uint64, copy=False)
+                bit_masks[i] = self.np.tensordot(chunk, bit_weights, axes=([1], [0]))
+        else:
+            chunks = padded_data.reshape(num_attributes, num_words, 64).astype(self.np.uint64, copy=False)
+            bit_masks = self.np.tensordot(chunks, bit_weights, axes=([2], [0])).astype(self.np.uint64, copy=False)
         return bit_masks
 
     def _cache_bitset_structures(
