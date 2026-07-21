@@ -3405,4 +3405,4 @@ viz = ["matplotlib", "scipy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.9,<4.0"
-content-hash = "2410783299372bb15a6fb53f80a71d3154ef55e7bc40658cc12beed87d202133"
+content-hash = "6c14eb585ac04f719f8f61516d436b2460c5f6bc7589ea90a51dd17d0e097f92"
