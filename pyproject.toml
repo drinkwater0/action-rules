@@ -23,7 +23,7 @@ packages = [
 python = ">=3.9,<4.0"
 click = "8.0.1"
 pandas = "^2.2.2"
-numpy = "^1.24"
+numpy = ">=1.24,<3.0"
 
 black  = { version = "^24.4.2", optional = true}
 isort  = { version = "^5.13.2", optional = true}
