@@ -349,6 +349,93 @@ class ActionRules:
             bit_masks = self.np.tensordot(chunks, bit_weights, axes=([2], [0])).astype(self.np.uint64, copy=False)
         return bit_masks
 
+    def build_bit_masks_direct(
+        self,
+        data: 'pandas.DataFrame',
+        stable_attributes: list,
+        flexible_attributes: list,
+        target: str,
+    ) -> tuple:
+        """
+        Pack bit masks straight from the categorical frame, with no one-hot step.
+
+        Parameters
+        ----------
+        data : pandas.DataFrame
+            The raw (not one-hot) dataset.
+        stable_attributes : list
+            List of stable attributes.
+        flexible_attributes : list
+            List of flexible attributes.
+        target : str
+            The target attribute.
+
+        Returns
+        -------
+        tuple
+            ``(bit_masks, columns)`` -- identical to what
+            ``build_bit_masks(df_to_array(one_hot_encode(...)))`` produces.
+
+        Notes
+        -----
+        ``one_hot_encode`` -> ``df_to_array`` -> ``build_bit_masks`` materializes the
+        dense transactions x items matrix three times over (the dummy frame, its
+        ``to_numpy`` copy, and the contiguous copy the packer needs) purely to
+        produce a structure that is 64x smaller than any of them.  At 10M rows x 96
+        items that scaffolding, not the bitset, is what peak memory is made of.
+
+        Here each source column is turned into a ``Categorical`` once -- the same
+        object ``get_dummies`` builds internally, so the category order, the NaN
+        handling and therefore the emitted column order are identical by
+        construction rather than by reimplementation -- and each category is
+        compared, packed and written directly into its row of ``bit_masks``.  Live
+        memory is one column of codes plus one row-length boolean buffer, both
+        reused, so the dense matrix never exists in any dtype.
+
+        Antecedent columns keep ``NaN`` as ``NaN`` (code ``-1``, matching no
+        category), preserving the pessimistic null semantics documented on
+        ``one_hot_encode``; the target is stringified in full so a missing target
+        becomes its own ``'nan'`` category.
+        """
+        if self.np is None or self.pd is None:
+            raise RuntimeError("Array library is not initialised. Call set_array_library first.")
+        np = self.np
+        num_transactions = len(data)
+        num_words = (num_transactions + 63) // 64
+        padded_transactions = num_words * 64
+
+        # Same treatment one_hot_encode applies, column by column instead of frame
+        # at a time: antecedents keep NaN, the target is stringified in full.
+        specs = []
+        for attributes, separator in (
+            (stable_attributes, '_<item_stable>_'),
+            (flexible_attributes, '_<item_flexible>_'),
+        ):
+            for attribute in attributes:
+                column = data[attribute]
+                as_string = column.where(column.isna(), column.astype(str))
+                specs.append((attribute, separator, self.pd.Categorical(as_string)))
+        specs.append((target, '_<item_target>_', self.pd.Categorical(data[target].astype(str))))
+
+        columns = [
+            attribute + separator + str(value)
+            for attribute, separator, categorical in specs
+            for value in categorical.categories
+        ]
+        bit_masks = np.zeros((len(columns), num_words), dtype=np.uint64)
+
+        # One padded buffer, reused by every item: `member[:n]` receives the
+        # comparison, the tail stays False so the padding bits are zero.
+        member = np.zeros(padded_transactions, dtype=bool)
+        row = 0
+        for _, _, categorical in specs:
+            codes = np.asarray(categorical.codes)
+            for code in range(len(categorical.categories)):
+                np.equal(codes, code, out=member[:num_transactions])
+                bit_masks[row] = np.packbits(member, bitorder='little').view(np.uint64)
+                row += 1
+        return bit_masks, columns
+
     def _cache_bitset_structures(
         self,
         bit_masks: Union['numpy.ndarray', 'cupy.ndarray'],
@@ -598,9 +685,26 @@ class ActionRules:
         self.target_state_bit_masks = None
         self.frames_bit_masks = None
         self.set_array_library(use_gpu, data)
-        if not self.is_onehot:
-            data = self.one_hot_encode(data, stable_attributes, flexible_attributes, target)
-        data, columns = self.df_to_array(data)
+        # Pack straight from the categorical frame when we can: it needs the raw
+        # data, so it does not apply to callers that pre-encoded, and it is
+        # pandas/NumPy only -- the GPU path already packs one attribute at a time
+        # and never built the large dense intermediate.
+        pack_direct = not self.is_onehot and not self.is_gpu_np and not self.is_gpu_pd
+        local_bit_masks = None
+        if pack_direct:
+            # `data` stays the raw frame here, so the transaction count has to be
+            # taken before the branches diverge -- on the encoded path it is the
+            # second axis of the transposed matrix, which the raw frame does not
+            # share.
+            num_transactions = len(data)
+            local_bit_masks, columns = self.build_bit_masks_direct(
+                data, stable_attributes, flexible_attributes, target
+            )
+        else:
+            if not self.is_onehot:
+                data = self.one_hot_encode(data, stable_attributes, flexible_attributes, target)
+            data, columns = self.df_to_array(data)
+            num_transactions = data.shape[1]
 
         stable_items_binding, flexible_items_binding, target_items_binding, column_values = self.get_bindings(
             columns, stable_attributes, flexible_attributes, target
@@ -613,7 +717,8 @@ class ActionRules:
         self._column_values = column_values
         self.intrinsic_utility_table, self.transition_utility_table = self.remap_utility_tables(column_values)
 
-        local_bit_masks = self.build_bit_masks(data)
+        if local_bit_masks is None:
+            local_bit_masks = self.build_bit_masks(data)
         self._cache_bitset_structures(local_bit_masks, target_items_binding, target)
         self.frames_bit_masks = self.get_split_bit_masks(target_items_binding, target)
 
@@ -647,7 +752,7 @@ class ActionRules:
             undesired_state,
             desired_state,
             columns,
-            data.shape[1],
+            num_transactions,
             self.intrinsic_utility_table,
             self.transition_utility_table,
         )
