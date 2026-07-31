@@ -1,6 +1,7 @@
 """Main class ActionRules."""
 
 import itertools
+import sys
 import warnings
 from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Any, Optional, Union  # noqa
@@ -327,7 +328,23 @@ class ActionRules:
             for i in range(num_attributes):
                 chunk = padded_data[i].reshape(num_words, 64).astype(self.np.uint64, copy=False)
                 bit_masks[i] = self.np.tensordot(chunk, bit_weights, axes=([1], [0]))
-        else:
+        elif sys.byteorder == 'little':
+            # Pack with the dedicated SIMD primitive instead of the tensordot.
+            # The tensordot route has to widen every transaction byte to uint64
+            # before the multiply-accumulate, so producing one 8-byte word costs
+            # a 512-byte intermediate: at 10M rows x 96 items that upcast alone
+            # is 7.7 GB, and it dominated peak RSS (measured 9.27 GB against a
+            # 120 MB final bit_masks). `packbits` reads the 64 bytes and writes
+            # the 8, so the intermediate is the packed array itself.
+            #
+            # `view` is a reinterpretation, not a conversion: eight little-endian
+            # uint8 lanes are one uint64, so `bit_masks` keeps the exact dtype,
+            # shape and values the tensordot produced -- the counting path is
+            # untouched. Guarded on byte order because the view would otherwise
+            # reverse each word's byte order; big-endian keeps the tensordot.
+            packed = self.np.packbits(padded_data, axis=1, bitorder='little')
+            bit_masks = packed.view(self.np.uint64)
+        else:  # pragma: no cover - big-endian hosts
             chunks = padded_data.reshape(num_attributes, num_words, 64).astype(self.np.uint64, copy=False)
             bit_masks = self.np.tensordot(chunks, bit_weights, axes=([2], [0])).astype(self.np.uint64, copy=False)
         return bit_masks
