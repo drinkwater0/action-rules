@@ -399,23 +399,45 @@ class ActionRules:
         """
         if self.np is None or self.pd is None:
             raise RuntimeError("Array library is not initialised. Call set_array_library first.")
-        np = self.np
+        np, pd = self.np, self.pd
         num_transactions = len(data)
         num_words = (num_transactions + 63) // 64
         padded_transactions = num_words * 64
 
         # Same treatment one_hot_encode applies, column by column instead of frame
         # at a time: antecedents keep NaN, the target is stringified in full.
+        # Stringifying costs four full passes over the column (isna, where,
+        # astype, and the object-content check inside it) and allocates a new
+        # object per cell -- 25% of fit at 1M rows. It is also a no-op whenever
+        # the frame already holds strings, which is the common case since CSV
+        # input is read as text. `infer_dtype` settles that in one non-allocating
+        # scan, and when it says the values are strings the conversion is exactly
+        # the identity, so skipping it cannot change a category or a code.
+        infer_dtype = pd.api.types.infer_dtype
+
+        def as_categorical(column, keep_missing: bool):
+            """Categorical over the column, stringified only when it is not already strings.
+
+            ``keep_missing`` mirrors ``one_hot_encode``: antecedents leave NaN as
+            NaN so it matches no category, while the target is stringified in
+            full so a missing target becomes its own ``'nan'`` category. That is
+            why the target cannot take the fast path when nulls are present --
+            for it, ``astype(str)`` is not the identity on NaN.
+            """
+            if infer_dtype(column, skipna=keep_missing) == 'string':
+                return pd.Categorical(column)
+            if keep_missing:
+                return pd.Categorical(column.where(column.isna(), column.astype(str)))
+            return pd.Categorical(column.astype(str))
+
         specs = []
         for attributes, separator in (
             (stable_attributes, '_<item_stable>_'),
             (flexible_attributes, '_<item_flexible>_'),
         ):
             for attribute in attributes:
-                column = data[attribute]
-                as_string = column.where(column.isna(), column.astype(str))
-                specs.append((attribute, separator, self.pd.Categorical(as_string)))
-        specs.append((target, '_<item_target>_', self.pd.Categorical(data[target].astype(str))))
+                specs.append((attribute, separator, as_categorical(data[attribute], True)))
+        specs.append((target, '_<item_target>_', as_categorical(data[target], False)))
 
         columns = [
             attribute + separator + str(value)
